@@ -11,7 +11,9 @@ import { formatUnits, keccak256, type Address, type Hex } from "viem";
 import { NATIVE_TOKEN, networkByChainId, type NetworkConfig } from "./config.js";
 import { planRegistryFunding, planRegistryWrite, keyStoreCacheOf } from "./internal/cachedRegistry.js";
 import { buildFirstActionPrepend, readActiveKeys, readPublicKey } from "./internal/keystore.js";
-import { buildPublicClient, buildRelayClient, quoteCalls, type Call, type CallsQuote } from "./internal/relay.js";
+import { buildPublicClient, buildRelayClient, quoteCalls, type Call, type CallsQuote,
+  type QuoteLeg,
+} from "./internal/relay.js";
 import { errorMessage, realSessionLegDeps, type SessionLegDeps } from "./internal/sessionLegs.js";
 import type { GrantSessionOptions, Session, SessionLeg } from "./internal/sessions.js";
 import type { Signer } from "./internal/signer.js";
@@ -53,10 +55,10 @@ export type QuoteLine = {
    */
   rootRegistration?: Pick<QuoteLine, "fee" | "feeToken" | "value" | "needed" | "neededFromRelay" | "fundedFromChainId">;
   /**
-   * The gas budget the relay quoted this leg. The number that decides whether
-   * the leg fits; see `CallsQuote.combinedGas`.
+   * The relay's quoted legs with their gas budgets, per leg. What decides
+   * whether each fits; see `CallsQuote.legs`.
    */
-  combinedGas?: bigint;
+  legs?: readonly QuoteLeg[];
   /** Why the fee could not be quoted. */
   reason?: string;
   /**
@@ -336,9 +338,9 @@ export async function withBalances(
 /** The quote fields a line keeps: fee, value, and the native amount needed. */
 function pickQuote(
   q: CallsQuote,
-): Pick<QuoteLine, "fee" | "feeToken" | "value" | "needed" | "neededFromRelay" | "fundedFromChainId" | "combinedGas"> {
+): Pick<QuoteLine, "fee" | "feeToken" | "value" | "needed" | "neededFromRelay" | "fundedFromChainId" | "legs"> {
   return {
-    ...(q.combinedGas !== undefined ? { combinedGas: q.combinedGas } : {}),
+    ...(q.legs.length ? { legs: q.legs } : {}),
     fee: q.fee,
     feeToken: q.feeToken,
     value: q.value,

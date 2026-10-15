@@ -87,7 +87,16 @@ const quote = await quoteCalls(buildRelayClient(registry), admin.address, admin,
 });
 
 console.log("");
-console.log(`combinedGas     ${quote.combinedGas ?? "(the relay's quote did not carry it)"}`);
+// Per leg. There is no correct scalar: each leg carries its own buffer and the
+// Orchestrator checks each against its own budget, so "does this fit" is a
+// per-leg question, and subtracting ONE buffer from a sum of two is wrong by a
+// whole buffer.
+console.log(`legs            ${quote.legs.length}`);
+const buffer = process.env.SDK_INTENT_BUFFER ? BigInt(process.env.SDK_INTENT_BUFFER) : undefined;
+for (const [i, leg] of quote.legs.entries()) {
+  const less = buffer !== undefined && leg.combinedGas !== undefined ? `  (less buffer: ${leg.combinedGas - buffer})` : "";
+  console.log(`  leg ${i}  chain ${leg.chainId ?? "?"}  combinedGas ${leg.combinedGas ?? "-"}${less}`);
+}
 console.log(`fee             ${formatEther(quote.fee)} (${quote.fee} wei)`);
 console.log(`value           ${formatEther(quote.value)}`);
 console.log(`nativeNeeded    ${formatEther(quote.nativeNeeded)}${quote.nativeNeededFromRelay ? " (the relay's own figure)" : ""}`);

@@ -502,21 +502,31 @@ export async function submitCallsDetailed(
 }
 
 /** What the relay would charge for an intent, without signing or sending it. */
+/** One leg of a quoted bundle: the relay quotes one per chain it will touch. */
+export type QuoteLeg = {
+  chainId?: number;
+  /** The gas budget for THIS leg, as signed. Compare a leg's need against this. */
+  combinedGas?: bigint;
+};
+
 export type CallsQuote = {
   /** Set when the relay quoted a second chain to fund this intent from: that chain. */
   fundedFromChainId?: number;
   /**
-   * The gas budget the relay quoted this intent, summed over its quotes.
+   * The gas budget the relay quoted, one entry per leg.
    *
-   * This is the number that decides whether an intent fits: the relay bounds
-   * execution by it, and a call sequence needing more runs out of gas and
-   * reverts with no reason, which the Orchestrator reports as `CallError()` —
-   * naming neither gas nor the call. On 2026-10-07 that cost three escrowed
-   * runs and five revisions of the relay's intent buffer to establish a number
-   * the quote already contained. Absent when the relay's quote did not carry
-   * it.
+   * This is what decides whether an intent fits: the relay bounds execution by
+   * it, and a call sequence needing more runs out of gas and reverts with no
+   * reason, which the Orchestrator reports as `CallError()` — naming neither
+   * gas nor the call. On 2026-10-07 that cost three escrowed runs and five
+   * revisions of the relay's intent buffer to establish a number the quote
+   * already contained.
+   *
+   * Deliberately not reduced to a scalar. There is no correct scalar: each leg
+   * carries its own buffer and is checked against its own budget, so "does this
+   * fit" is a per-leg question. Empty when the relay's quote carried no legs.
    */
-  combinedGas?: bigint;
+  legs: readonly QuoteLeg[];
   /** Maximum fee the intent pays, in `feeToken` base units, summed over the relay's quotes. */
   fee: bigint;
   /** The token the relay is charging its fee in (the zero address is native). */
@@ -553,10 +563,9 @@ export async function quoteCalls(
   // The token the relay quoted in; the one the rule named when the quote does not say.
   const feeToken = paymentTokenFromPrepared(prepared) ?? named ?? NATIVE_TOKEN;
   const fundedFromChainId = fundedFromChainIdOf(prepared, client.chain?.id);
-  const combinedGas = combinedGasFromPrepared(prepared);
   return {
     ...(fundedFromChainId !== undefined ? { fundedFromChainId } : {}),
-    ...(combinedGas !== undefined ? { combinedGas } : {}),
+    legs: quoteLegsFromPrepared(prepared),
     fee,
     feeTokenDeficit,
     feeToken,
@@ -609,22 +618,27 @@ export function nativeNeededFromPrepared(
 }
 
 /**
- * The gas budget the relay quoted, summed over the response's quotes.
+ * The relay's quoted legs, each with its own gas budget.
  *
- * Undefined rather than 0n when no quote carries it: 0 would read as "the relay
- * quoted no gas", which is a different claim from "the relay did not say".
+ * Per leg, never summed. The relay adds its buffer per intent
+ * (`relay src/types/simulator.rs:100`) and the Orchestrator evaluates the 63/64
+ * gas check per intent against that intent's own `combinedGas`
+ * (`Orchestrator.sol:331`), so a leg fits or starves on its own number. A sum
+ * can look comfortable while one leg starves, and an estimate derived by
+ * subtracting ONE buffer from a sum of two is wrong by a whole buffer — which
+ * is what made the same `registerKey` call appear to cost 7.6x more on one
+ * wallet than another (infra, 2026-10-15).
  */
-export function combinedGasFromPrepared(prepared: any): bigint | undefined {
+export function quoteLegsFromPrepared(prepared: any): readonly QuoteLeg[] {
   const quotes: any[] = prepared?.context?.quote?.quotes ?? [];
-  let total = 0n;
-  let seen = false;
-  for (const q of quotes) {
+  return quotes.map((q) => {
     const g = q?.intent?.combinedGas;
-    if (g === undefined || g === null || g === "") continue;
-    total += toBigInt(g);
-    seen = true;
-  }
-  return seen ? total : undefined;
+    const chainId = q?.chainId;
+    return {
+      ...(chainId !== undefined && chainId !== null ? { chainId: Number(chainId) } : {}),
+      ...(g !== undefined && g !== null && g !== "" ? { combinedGas: toBigInt(g) } : {}),
+    };
+  });
 }
 
 /** Reads the fee out of a prepareCalls response (porto decodes the quote's hex amounts). */
