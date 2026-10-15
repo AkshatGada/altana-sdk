@@ -60,14 +60,21 @@ const prepend = await buildFirstActionPrepend({
 console.log(`root registered ${prepend.length === 0 ? "yes — this quotes the SESSION intent alone" : "NO — the SDK would prepend the root"}`);
 
 const fee = await readRegistrationFee(registryClient, registry);
-const calls = [
+// SDK_CALL_COUNT repeats the registration for a deliberately larger intent.
+// Measured 2026-10-15 at buffer 1,500,000: this moves the DESTINATION leg
+// (1,832,440 -> 2,924,864 from 1 call to 3) and leaves the SOURCE leg exactly
+// where it was (1,790,089 both times). So intent size is not a lever on the
+// source leg, and this cannot test a source-leg-cost hypothesis. Kept because
+// per-leg quotes are worth having; read it as an instrument, not an argument.
+const callCount = Number(process.env.SDK_CALL_COUNT ?? "1");
+const calls = Array.from({ length: callCount }, () =>
   buildAdditionalRegisterCall({
-    publicKey: session.publicKey,
+    publicKey: createPrivateKeySigner().publicKey,
     fee,
     network: registry,
     expiry: Math.floor(Date.now() / 1000) + 3600,
   }),
-];
+);
 
 const requiredFunds = await planRegistryFunding({
   registryClient,
@@ -91,6 +98,7 @@ console.log("");
 // Orchestrator checks each against its own budget, so "does this fit" is a
 // per-leg question, and subtracting ONE buffer from a sum of two is wrong by a
 // whole buffer.
+console.log(`calls           ${callCount}`);
 console.log(`legs            ${quote.legs.length}`);
 const buffer = process.env.SDK_INTENT_BUFFER ? BigInt(process.env.SDK_INTENT_BUFFER) : undefined;
 for (const [i, leg] of quote.legs.entries()) {
