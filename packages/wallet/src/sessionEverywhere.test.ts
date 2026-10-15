@@ -40,13 +40,23 @@ function fakeChains(script: {
   unknownBlock?: number[];
   /** Registry chains whose write the relay funds from an L2: registry chain id to source chain id. */
   fundFrom?: Record<number, number>;
+  /** Registry chains whose write blocks until `release()` is called. */
+  holdRegistry?: number[];
 } = {}) {
   const log = {
     account: [] as Submitted[],
     registry: [] as Submitted[],
     cache: [] as { chainId: number; afterL1Block: bigint | undefined }[],
     order: [] as string[],
+    /** Account intents still unmined when each registry write was submitted. */
+    inFlightAtRegistry: [] as { registry: number; accounts: number[] }[],
   };
+  /** Account intents submitted but not yet mined, by chain. */
+  const inFlight = new Set<number>();
+  let release!: () => void;
+  const held = new Promise<void>((r) => {
+    release = r;
+  });
   const has = (list: number[] | undefined, id: number) => (list ?? []).includes(id);
   let block = 100n;
   const deps: SessionLegDeps = {
@@ -65,7 +75,9 @@ function fakeChains(script: {
     },
     async submitAccountIntent(n, args): Promise<IntentOutcome> {
       log.account.push({ chainId: n.chainId, calls: args.calls, args });
+      inFlight.add(n.chainId);
       await tick();
+      inFlight.delete(n.chainId);
       log.order.push(`account:${n.chainId}`);
       if (has(script.failAccount, n.chainId)) return { status: "FAILED", reason: "relay status FAILED" };
       return {
@@ -80,6 +92,8 @@ function fakeChains(script: {
     },
     async submitRegistry(r, args) {
       log.registry.push({ chainId: r.chainId, calls: args.calls, args });
+      log.inFlightAtRegistry.push({ registry: r.chainId, accounts: [...inFlight].sort((a, b) => a - b) });
+      if (has(script.holdRegistry, r.chainId)) await held;
       await tick();
       log.order.push(`registry:${r.chainId}`);
       const via = r.relayUrl ? "relay" : "eoa";
@@ -106,7 +120,7 @@ function fakeChains(script: {
     async waitForKeyVisible() {},
     async sleep() {},
   };
-  return { deps, log };
+  return { deps, log, release };
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 1));
@@ -398,6 +412,20 @@ describe("grantSession returns before the cache proofs", () => {
     expect(await result.cacheSync).toEqual(result.legs.filter((l) => l.kind === "cache"));
   });
 
+  test("populateCache: \"await\" lists each registry leg once, deferred or not", async () => {
+    // `registration` reports every registry leg, including the ones already
+    // final at return, so taking it wholesale into `legs` double-counted them.
+    const { deps } = fakeChains();
+    const result = await grant([CELO_SEPOLIA, BNB], deps, { populateCache: "await" });
+
+    const registry = result.legs.filter((l) => l.kind === "registry");
+    expect(registry.map((l) => `${l.chainId}:${l.status}`).sort()).toEqual([
+      "11155111:CONFIRMED",
+      "56:CONFIRMED",
+    ]);
+    expect(new Set(registry.map((l) => l.chainId)).size).toBe(registry.length);
+  });
+
   test("populateCache: false skips the proofs and cacheSync resolves at once", async () => {
     const { deps, log } = fakeChains({});
     const result = await grant([BASE_SEPOLIA], deps, { populateCache: false });
@@ -407,23 +435,29 @@ describe("grantSession returns before the cache proofs", () => {
 });
 
 describe("grantSession everywhere", () => {
-  test("one registry write on Sepolia, then an account leg and a cache proof on each L2", async () => {
+  test("an account leg on each L2 first, then one registry write on Sepolia, then the cache proofs", async () => {
     const { deps, log } = fakeChains();
     const result = await grant([CELO_SEPOLIA, BASE_SEPOLIA], deps);
 
-    expect(log.registry.map((s) => s.chainId)).toEqual([11155111]);
-    expect(log.registry[0]!.calls[0]!.value).toBe(7n);
     expect(log.account.map((s) => s.chainId).sort((a, b) => a - b)).toEqual([84532, 11142220]);
     expect(log.account.every((s) => s.calls.length === 0 && s.args.authorizeKeys.length === 1)).toBe(true);
-    // The registry write lands before any account authorization behind it.
-    expect(log.order.indexOf("registry:11155111")).toBeLessThan(log.order.indexOf("account:11142220"));
-    const registryBlock = result.legs.find((l) => l.kind === "registry")!.blockNumber;
+    expect(result.status).toBe("granted");
+    expect(result.keyId).toBe(keccak256(result.publicKey));
+    expect(result.keyHash).toBe(keyHashForSigner(result.signer));
+
+    const registryLegs = await result.registration;
+    // Reversed deliberately: the authorization no longer waits for the L1.
+    // Both authorizations land before the registry write starts.
+    expect(log.order.indexOf("account:11142220")).toBeLessThan(log.order.indexOf("registry:11155111"));
+    expect(log.order.indexOf("account:84532")).toBeLessThan(log.order.indexOf("registry:11155111"));
+    expect(log.registry.map((s) => s.chainId)).toEqual([11155111]);
+    expect(log.registry[0]!.calls[0]!.value).toBe(7n);
+    const registryBlock = registryLegs.find((l) => l.kind === "registry")!.blockNumber;
+    await result.cacheSync;
     expect(log.cache).toEqual([
       { chainId: 11142220, afterL1Block: registryBlock },
       { chainId: 84532, afterL1Block: registryBlock },
     ]);
-    expect(result.status).toBe("granted");
-    expect(result.keyId).toBe(keccak256(result.publicKey));
   });
 
   test("a key already valid in the registry is not written again", async () => {
@@ -446,15 +480,39 @@ describe("grantSession everywhere", () => {
     expect(result.status).toBe("granted");
   });
 
-  test("a failed registry write fails the grant and skips the authorizations behind it", async () => {
+  test("a failed registry write no longer skips a cached network's authorization", async () => {
     const { deps, log } = fakeChains({ failRegistry: [11155111] });
-    const result = await grant([CELO_SEPOLIA, BASE_SEPOLIA, BNB], deps);
+    const events: { status: string; detail?: { chainId: number; reason?: string } }[] = [];
+    const result = await grant([CELO_SEPOLIA, BASE_SEPOLIA, BNB], deps, {
+      onStatus: (status: string, detail?: { chainId: number; reason?: string }) => events.push({ status, detail }),
+    });
 
-    expect(result.status).toBe("failed");
-    expect(log.account.map((s) => s.chainId)).toEqual([56]);
-    expect(result.legs.filter((l) => l.kind === "account" && l.status === "SKIPPED").map((l) => l.chainId)).toEqual([
-      11142220, 84532,
+    // Every authorization ran, including the two behind the failing registry.
+    expect(log.account.map((s) => s.chainId).sort((a, b) => a - b)).toEqual([56, 84532, 11142220]);
+    expect(result.legs.filter((l) => l.kind === "account" && l.status === "SKIPPED")).toEqual([]);
+    // The write is still running at return, so the grant is usable and says so.
+    expect(result.status).toBe("granted");
+    expect(result.legs.find((l) => l.kind === "registry" && l.chainId === 11155111)!.status).toBe("PENDING");
+
+    // It surfaces when it fails: a FAILED leg with the reason, and an event.
+    const registryLegs = await result.registration;
+    const sepolia = registryLegs.find((l) => l.chainId === 11155111)!;
+    expect(sepolia.status).toBe("FAILED");
+    expect(sepolia.reason).toBe("reverted");
+    expect(events.filter((e) => e.status === "registry-write-failed")).toEqual([
+      { status: "registry-write-failed", detail: { chainId: 11155111, reason: "reverted" } },
     ]);
+  });
+
+  test("a non-cached network's authorization still waits for its registry write", async () => {
+    // BNB's registry is its own chain, so it bundles. Ethereum is the registry
+    // for nothing cached here, so the old order holds for it.
+    const { deps, log } = fakeChains({ failRegistry: [1] });
+    const base: NetworkConfig = { ...BASE_SEPOLIA, registry: { kind: "local" } };
+    const result = await grant([{ ...base, chainId: 999, registry: { kind: "cached", l1: ETHEREUM, keyStoreCache: "0x0000000000000000000000000000000000000c0c" } }], deps);
+    // Cached: it authorizes anyway.
+    expect(log.account.map((s) => s.chainId)).toEqual([999]);
+    expect(result.status).toBe("granted");
   });
 
   test("a failed account leg fails the grant; the other chain still completes", async () => {
@@ -462,6 +520,7 @@ describe("grantSession everywhere", () => {
     const result = await grant([CELO_SEPOLIA, BASE_SEPOLIA], deps);
 
     expect(result.status).toBe("failed");
+    await result.cacheSync;
     expect(log.cache.map((c) => c.chainId)).toEqual([11142220]);
   });
 
@@ -501,8 +560,9 @@ describe("cache proofs wait for the registry write's block", () => {
     const { deps, log } = fakeChains();
     const result = await grant([CELO_SEPOLIA, BASE_SEPOLIA], deps);
 
-    const registryBlock = legOfKind(result, "registry").blockNumber;
+    const registryBlock = (await result.registration).find((l) => l.chainId === 11155111)!.blockNumber;
     expect(registryBlock).toBeDefined();
+    await result.cacheSync;
     expect(log.cache.map((c) => c.afterL1Block)).toEqual([registryBlock, registryBlock]);
   });
 
@@ -510,8 +570,13 @@ describe("cache proofs wait for the registry write's block", () => {
     const { deps, log } = fakeChains({ unknownBlock: [11155111] });
     const result = await grant([CELO_SEPOLIA, BASE_SEPOLIA], deps);
 
+    // The write is background work now, so its block is not known at return:
+    // the cache legs can only read PENDING here and fail through cacheSync.
+    expect(result.legs.filter((l) => l.kind === "cache").map((l) => l.status)).toEqual(["PENDING", "PENDING"]);
+    expect(result.status).toBe("granted");
+
+    const caches = await result.cacheSync;
     expect(log.cache).toEqual([]);
-    const caches = result.legs.filter((l) => l.kind === "cache");
     expect(caches.map((l) => [l.chainId, l.status])).toEqual([
       [11142220, "FAILED"],
       [84532, "FAILED"],
@@ -519,8 +584,7 @@ describe("cache proofs wait for the registry write's block", () => {
     expect(caches[0]!.reason).toContain("registry block unknown on chain 11155111, proof not attempted");
     expect(caches[0]!.reason).toContain("public RPC receipt lookup failed 5 times");
     // The registration and the account authorizations themselves still confirmed.
-    expect(legOfKind(result, "registry").status).toBe("CONFIRMED");
-    expect(result.status).toBe("failed");
+    expect((await result.registration).find((l) => l.chainId === 11155111)!.status).toBe("CONFIRMED");
   });
 
   test("grant: a key already valid in the registry is proven without a block (no write happened)", async () => {
@@ -578,15 +642,96 @@ function legOfKind(result: { legs: { kind: string; blockNumber?: bigint; status:
   return leg;
 }
 
+/**
+ * Celo-first grants. On a network with a cached registry the account
+ * authorization goes first and the KeyStore write follows in the background,
+ * so the session is usable in seconds instead of after an L1 confirmation it
+ * does not need. Doris saw the old order live on 2026-10-15
+ * (evidence/2026-10-15-demo-grant-did-authorize-on-celo.md).
+ */
+describe("grantSession authorizes a cached network first", () => {
+  test("the grant returns while the registry write is still running, and resolves it later", async () => {
+    const { deps, log, release } = fakeChains({ holdRegistry: [11155111] });
+    const result = await grant([CELO_SEPOLIA], deps);
+
+    // Returned: the authorization is in, the write is not.
+    expect(result.status).toBe("granted");
+    expect(legOfKind(result, "account").status).toBe("CONFIRMED");
+    expect(result.legs.find((l) => l.kind === "registry")!.status).toBe("PENDING");
+    expect(log.account.map((s) => s.chainId)).toEqual([11142220]);
+
+    // `registration` really is still pending, not already resolved.
+    const pending = Symbol("pending");
+    expect(await Promise.race([result.registration, Promise.resolve(pending)])).toBe(pending);
+
+    release();
+    const registryLegs = await result.registration;
+    expect(registryLegs.find((l) => l.chainId === 11155111)!.status).toBe("CONFIRMED");
+  });
+
+  test("the registry write starts with no account intent of its own L2s in flight", async () => {
+    // The write is paid by an intent from the wallet's account on the L2, and
+    // the relay reserves no nonce for an unmined intent, so the two must not
+    // overlap (2026-09-28-back-to-back-race-attribution.md).
+    const { deps, log } = fakeChains();
+    const result = await grant([CELO_SEPOLIA, BASE_SEPOLIA], deps);
+    await result.registration;
+
+    expect(log.inFlightAtRegistry).toEqual([{ registry: 11155111, accounts: [] }]);
+  });
+
+  test("no authorization confirmed means the write is not attempted at all", async () => {
+    const { deps, log } = fakeChains({ failAccount: [11142220] });
+    const result = await grant([CELO_SEPOLIA], deps);
+
+    expect(result.status).toBe("failed");
+    const registry = (await result.registration).find((l) => l.chainId === 11155111)!;
+    expect(registry.status).toBe("SKIPPED");
+    expect(registry.reason).toBe(
+      "no account authorization confirmed on 11142220, so the KeyStore write was not attempted",
+    );
+    expect(log.registry).toEqual([]);
+  });
+
+  test("the key hash the account indexes by is not the KeyStore keyId", async () => {
+    // Reaching for `keyId` to check a grant on the account reverts
+    // KeyDoesNotExist() whether or not the session is live, which is what made
+    // a landed grant look like a missing one on 2026-10-15.
+    const { deps } = fakeChains();
+    const result = await grant([CELO_SEPOLIA], deps);
+
+    expect(result.keyId).toBe(keccak256(result.publicKey));
+    expect(result.keyHash).toBe(computeAccountSecp256k1KeyHash(result.signer.address));
+    expect(result.keyHash).not.toBe(result.keyId);
+  });
+
+  test("revoke is unchanged: both legs final at return, nothing deferred", async () => {
+    // Revoke never gated the account leg on the registry (the two run
+    // together), so Celo-first has nothing to change there. What would show a
+    // leak is a PENDING registry leg or a `registration` promise.
+    const { deps, log } = fakeChains({ holds: [11142220], registryValid: [11155111] });
+    const result = await revoke([CELO_SEPOLIA], deps);
+
+    expect(result.status).toBe("revoked");
+    expect(log.registry.map((s) => s.chainId)).toEqual([11155111]);
+    expect(result.legs.filter((l) => l.kind !== "cache").map((l) => `${l.kind}:${l.status}`)).toEqual([
+      "account:CONFIRMED",
+      "registry:CONFIRMED",
+    ]);
+    expect((result as unknown as { registration?: unknown }).registration).toBeUndefined();
+  });
+});
+
 describe("registry write funded from the L2", () => {
   test("the registry leg names the source chain and the cache proof still anchors on its block", async () => {
     const { deps, log } = fakeChains({ fundFrom: { [SEPOLIA.chainId]: CELO_SEPOLIA.chainId } });
     const result = await grant([CELO_SEPOLIA], deps);
     expect(result.status).toBe("granted");
-    const registry = result.legs.find((l) => l.kind === "registry")!;
+    const registry = (await result.registration).find((l) => l.kind === "registry")!;
     expect(registry.fundedFromChainId).toBe(CELO_SEPOLIA.chainId);
     expect(registry.sourceTransactionHash).toBe(`0x${"cc".repeat(32)}`);
     expect(registry.blockNumber).toBeDefined();
+    await result.cacheSync;
     expect(log.cache[0]?.afterL1Block).toBe(registry.blockNumber);
     expect(result.legs.find((l) => l.kind === "account")?.fundedFromChainId).toBeUndefined();
   });

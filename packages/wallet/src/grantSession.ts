@@ -93,13 +93,20 @@ export type GrantSessionConfig = {
  * Pass the returned Session to whichever process runs the agent. The agent
  * calls execute(session, calls) — never the admin.
  *
- * 1. Registry: one KeyStore write per registry chain, skipped where the key
- *    is already valid. When the registry chain is itself one of `networks`
- *    (BNB, Ethereum) the write rides in that network's account leg.
- * 2. Account: one authorization per network, in parallel. A cached network's
- *    leg waits for its registry chain's write and is skipped if it failed.
+ * 1. Account: one authorization per network, in parallel. On a network with a
+ *    cached registry (Celo) this goes FIRST and waits for nothing, so the key
+ *    is usable as soon as this call returns.
+ * 2. Registry: one KeyStore write per registry chain, skipped where the key is
+ *    already valid. When the registry chain is itself one of `networks` (BNB,
+ *    Ethereum) the write rides in that network's account leg. Behind a cached
+ *    network the write runs in the BACKGROUND after that network's
+ *    authorization confirms: its leg reads `PENDING` in `legs` and resolves
+ *    through `result.registration`.
  * 3. Cache: for each cached network, the proof of the registry entry into its
- *    KeyStoreCache.
+ *    KeyStoreCache. It needs the write's block, so it chains after (2).
+ *
+ * A network with no cached registry is unchanged: its authorization still
+ * waits for the registry write and is skipped if that failed.
  *
  * Never throws for a failed leg: check `result.status`. Throws only for an
  * empty `networks`.
@@ -198,6 +205,69 @@ export async function runGrantSession(
   const registryLegs: Promise<SessionLeg>[] = [];
   const execution = new Set(networks.map((n) => n.chainId));
 
+  // Cached networks, by the registry chain behind them, excluding a registry
+  // chain that is itself one of `networks` (there the write rides that chain's
+  // own account leg, on its own nonce, and nothing has to be sequenced).
+  //
+  // These are the networks that authorize FIRST: the account enforces the key
+  // locally, so the authorization needs nothing from the KeyStore, and making
+  // it wait for an L1 confirmation left the session unusable for as long as
+  // that took. Their registry write becomes background work instead.
+  const cachedBehind = new Map<number, NetworkConfig[]>();
+  for (const n of networks) {
+    if (!isCachedRegistry(n)) continue;
+    const l1 = registryNetwork(n).chainId;
+    if (execution.has(l1)) continue;
+    const list = cachedBehind.get(l1);
+    if (list) list.push(n);
+    else cachedBehind.set(l1, [n]);
+  }
+
+  // A deferred write cannot be built until the account legs exist, and the
+  // account legs of networks that still depend on a registry write cannot be
+  // built until the write promise exists. This gate breaks the knot: the
+  // deferred writes are created now and start looking at `accountDone` only
+  // once every leg has been put there.
+  let openGate!: () => void;
+  const accountLegsBuilt = new Promise<void>((r) => {
+    openGate = r;
+  });
+
+  /** A deferred write that never ran, with the reason it was not attempted. */
+  type NotAttempted = { notAttempted: string };
+  type DeferredWrite = NotAttempted | (IntentOutcome & { via?: SessionLeg["via"] });
+  const deferredLegs: Promise<SessionLeg>[] = [];
+  /** Registry chains whose write was actually deferred, so it is still running. */
+  const deferredChains = new Set<number>();
+  /** Registry legs settled here and now, for `registration` to report too. */
+  const decidedRegistryLegs: SessionLeg[] = [];
+
+  /** The write itself, once something has decided it should happen. */
+  const runWrite = async (r: NetworkConfig): Promise<IntentOutcome & { via?: SessionLeg["via"] }> => {
+    // Kept unconditional so a consumer still sees the event when the write
+    // fails before any intent is attempted, or when a dep reports no steps.
+    onStatus?.("registry-write", { chainId: r.chainId });
+    let fee: bigint;
+    try {
+      fee = await deps.registrationFee(r);
+    } catch (err) {
+      return {
+        via: r.relayUrl ? "relay" : "eoa",
+        status: "FAILED",
+        reason: `could not read the registration fee: ${errorMessage(err)}`,
+      };
+    }
+    // A first-time write is two intents; the step says which one is running.
+    // The event name is unchanged, so a consumer ignoring `step` sees
+    // `registry-write` twice, which is what actually happens.
+    return deps.submitRegistry(r, {
+      wallet,
+      adminSigner,
+      calls: [registerCall(r, fee)],
+      onStep: (step) => onStatus?.("registry-write", { chainId: r.chainId, step }),
+    });
+  };
+
   registries.forEach((r, i) => {
     const read = registryReads[i]!;
     if ("error" in read) {
@@ -206,40 +276,67 @@ export async function runGrantSession(
         reason: `could not read the registry: ${read.error}`,
       };
       registryDone.set(r.chainId, Promise.resolve(failed));
-      legs.push(legFromOutcome(r.chainId, "registry", failed));
+      const leg = legFromOutcome(r.chainId, "registry", failed);
+      legs.push(leg);
+      decidedRegistryLegs.push(leg);
       return;
     }
     if (read.value) {
-      legs.push(skippedLeg(r.chainId, "registry", "already registered and valid"));
+      const leg = skippedLeg(r.chainId, "registry", "already registered and valid");
+      legs.push(leg);
+      decidedRegistryLegs.push(leg);
       return;
     }
     if (execution.has(r.chainId)) {
       bundled.add(r.chainId);
       return;
     }
-    // Unchanged: the write for this chain is starting. Kept unconditional so a
-    // consumer still sees the event when the write fails before any intent is
-    // attempted, or when a dep reports no steps at all.
-    onStatus?.("registry-write", { chainId: r.chainId });
-    const done = (async () => {
-      let fee: bigint;
-      try {
-        fee = await deps.registrationFee(r);
-      } catch (err) {
-        return { via: r.relayUrl ? "relay" : "eoa", status: "FAILED", reason: `could not read the registration fee: ${errorMessage(err)}` } as const;
+    const first = cachedBehind.get(r.chainId);
+    if (!first) {
+      // No cached network behind this registry: the write still goes first and
+      // the authorizations behind it wait, exactly as before.
+      const done = runWrite(r);
+      registryDone.set(r.chainId, done);
+      registryLegs.push(done.then((o) => legFromOutcome(r.chainId, "registry", o, o.via)));
+      return;
+    }
+
+    // Deferred. The write is paid by an intent from the wallet's account on
+    // one of these same L2s, and the relay reserves no nonce for an intent it
+    // has not mined (evidence/2026-09-28-back-to-back-race-attribution.md), so
+    // starting it while an authorization is in flight on that chain would make
+    // the two read the same nonce. Waiting for the authorizations to settle is
+    // what keeps them off each other — not a delay for its own sake.
+    deferredChains.add(r.chainId);
+    const write = (async (): Promise<DeferredWrite> => {
+      await accountLegsBuilt;
+      const outcomes = await Promise.all(first.map((n) => accountDone.get(n.chainId)!));
+      if (!outcomes.some((o) => o?.status === "CONFIRMED")) {
+        return {
+          notAttempted:
+            `no account authorization confirmed on ${first.map((n) => n.chainId).join(", ")}, ` +
+            `so the KeyStore write was not attempted`,
+        };
       }
-      // A first-time write is two intents; the step says which one is running.
-      // The event name is unchanged, so a consumer ignoring `step` sees
-      // `registry-write` twice, which is what actually happens.
-      return deps.submitRegistry(r, {
-        wallet,
-        adminSigner,
-        calls: [registerCall(r, fee)],
-        onStep: (step) => onStatus?.("registry-write", { chainId: r.chainId, step }),
-      });
+      return runWrite(r);
     })();
-    registryDone.set(r.chainId, done);
-    registryLegs.push(done.then((o) => legFromOutcome(r.chainId, "registry", o, o.via)));
+
+    registryDone.set(
+      r.chainId,
+      write.then((w) => ("notAttempted" in w ? { status: "FAILED", reason: w.notAttempted } : w)),
+    );
+    deferredLegs.push(
+      write.then((w) => {
+        if ("notAttempted" in w) return skippedLeg(r.chainId, "registry", w.notAttempted);
+        if (w.status !== "CONFIRMED") {
+          onStatus?.("registry-write-failed", {
+            chainId: r.chainId,
+            ...(w.reason ? { reason: w.reason } : {}),
+          });
+        }
+        return legFromOutcome(r.chainId, "registry", w, w.via);
+      }),
+    );
   });
 
   // 2. Account legs.
@@ -247,8 +344,13 @@ export async function runGrantSession(
   for (const n of networks) {
     const bundle = bundled.has(n.chainId);
     // A failed standalone registry write (or registry read) skips the
-    // authorization on every network behind that registry.
-    const dependsOn = bundle ? undefined : registryDone.get(registryNetwork(n).chainId);
+    // authorization on every network behind that registry — except on a
+    // network with a cached registry, which authorizes first and waits for
+    // nothing. There the account is the authority on whether the key may act;
+    // the KeyStore entry is the public record of it, and a missing record
+    // makes the session unverifiable by third parties, not unusable.
+    const dependsOn =
+      bundle || isCachedRegistry(n) ? undefined : registryDone.get(registryNetwork(n).chainId);
     const done = (async (): Promise<IntentOutcome | undefined> => {
       if (dependsOn && (await dependsOn).status !== "CONFIRMED") return undefined;
       let calls: Call[] = [];
@@ -291,6 +393,9 @@ export async function runGrantSession(
       );
     }
   }
+  // Every leg is in `accountDone`: the deferred writes may look at it now.
+  openGate();
+
   const accountLegs = networks.map(async (n) => {
     const outcome = await accountDone.get(n.chainId)!;
     if (outcome) return legFromOutcome(n.chainId, "account", outcome);
@@ -304,10 +409,16 @@ export async function runGrantSession(
   // 3. Cache legs, per cached network. The gate settles with the legs before
   // it; the proof waits for the L2 to anchor the registry block and runs on
   // after the grant returns unless the caller asked to wait.
-  const cacheGates = networks.filter(isCachedRegistry).map(async (n): Promise<CacheGate> => {
+
+  /** Decided without waiting for anything, so it is reported at return. */
+  const staticCacheSkip = (n: NetworkConfig): SessionLeg | undefined => {
     if (!register) return skippedLeg(n.chainId, "cache", "register: false");
     if (!populate) return skippedLeg(n.chainId, "cache", "populateCache: false");
     if (!hasCache(n)) return skippedLeg(n.chainId, "cache", "no KeyStoreCache configured");
+    return undefined;
+  };
+
+  const cacheGate = async (n: NetworkConfig): Promise<CacheGate> => {
     const l1 = registryNetwork(n).chainId;
     const [account, written] = await Promise.all([accountDone.get(n.chainId)!, registryDone.get(l1)]);
     if (!account || account.status !== "CONFIRMED") {
@@ -335,6 +446,18 @@ export async function runGrantSession(
         );
       },
     };
+  };
+
+  // One slot per cached network, in `networks` order so every list below
+  // agrees. A slot whose registry write was deferred cannot know its outcome
+  // before this call returns, so it reads PENDING and resolves in `cacheSync`.
+  const cacheSlots = networks.filter(isCachedRegistry).map((n) => {
+    const skip = staticCacheSkip(n);
+    // Deferred only when a write for this registry really was deferred. A
+    // registry that needed no write (key already valid) or whose write rode an
+    // account intent settles here, as it always did.
+    const deferred = !skip && deferredChains.has(registryNetwork(n).chainId);
+    return { network: n, skip, deferred, gate: skip || deferred ? undefined : cacheGate(n) };
   });
 
   const catchUp = (async () => {
@@ -342,15 +465,57 @@ export async function runGrantSession(
     if (outcomes.some((o) => o?.status === "CONFIRMED")) await deps.sleep(RELAY_CATCH_UP_MS);
   })();
 
-  const [accounts, registryWrites, gates] = await Promise.all([
+  // The registry legs, final: the ones already decided, the ones riding an
+  // account intent, and the deferred writes once they land. Never rejects.
+  const registration = (async (): Promise<SessionLeg[]> => {
+    const [running, deferred] = await Promise.all([
+      Promise.all(registryLegs),
+      Promise.all(deferredLegs),
+    ]);
+    return [...decidedRegistryLegs, ...running, ...deferred];
+  })();
+
+  const gated = cacheSlots.filter((s) => s.gate);
+  const [accounts, registryWrites, settledGates] = await Promise.all([
     Promise.all(accountLegs),
     Promise.all(registryLegs),
-    Promise.all(cacheGates),
+    Promise.all(gated.map((s) => s.gate!)),
     catchUp,
   ]);
-  const proofs = launchCacheProofs(gates);
-  const caches = awaitCache ? await proofs.cacheSync : proofs.now;
-  legs.push(...accounts, ...registryWrites, ...caches);
+
+  // Proofs whose gate settled before returning start together, as they always
+  // have. A deferred slot starts its own once its registry write has landed.
+  const settledProofs = launchCacheProofs(settledGates);
+  const settledNow = new Map(gated.map((s, i) => [s.network.chainId, settledProofs.now[i]!]));
+
+  const slotLegs = cacheSlots.map((s) => {
+    if (s.skip) return { now: s.skip, final: Promise.resolve(s.skip) };
+    if (!s.deferred) {
+      const now = settledNow.get(s.network.chainId)!;
+      const final = settledProofs.cacheSync.then(
+        (all) => all.find((l) => l.chainId === s.network.chainId) ?? now,
+      );
+      return { now, final };
+    }
+    const final = (async () => {
+      const gate = await cacheGate(s.network);
+      const [leg] = await launchCacheProofs([gate]).cacheSync;
+      return leg!;
+    })();
+    const now: SessionLeg = { chainId: s.network.chainId, kind: "cache", status: "PENDING" };
+    return { now, final };
+  });
+
+  const cacheSync = Promise.all(slotLegs.map((l) => l.final));
+
+  // `await` means the caller wants the finished picture, and a cache proof
+  // cannot finish before the registry write it proves: waiting for the proofs
+  // means waiting for the registration too. Only the DEFERRED legs are taken
+  // from it — the rest are already in `legs` and `registryWrites`.
+  const [caches, deferredFinal] = awaitCache
+    ? await Promise.all([cacheSync, Promise.all(deferredLegs)])
+    : [slotLegs.map((l) => l.now), deferredPendingLegs()];
+  legs.push(...accounts, ...registryWrites, ...deferredFinal, ...caches);
 
   onStatus?.("done");
   const ordered = orderLegs(legs);
@@ -361,10 +526,17 @@ export async function runGrantSession(
     permissions,
     expiry: opts.expiry,
     keyId,
+    keyHash,
     status: allLegsSucceeded(ordered) ? "granted" : "failed",
     legs: ordered,
-    cacheSync: proofs.cacheSync,
+    cacheSync,
+    registration,
   };
+
+  /** The deferred registry writes as they read at return: still running. */
+  function deferredPendingLegs(): SessionLeg[] {
+    return [...deferredChains].map((chainId) => ({ chainId, kind: "registry", status: "PENDING" }));
+  }
 }
 
 /**
