@@ -23,9 +23,11 @@ import {
   type Address,
   type Hex,
   type PublicClient,
+  type Transport,
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { NATIVE_TOKEN, networkByChainId, type NetworkConfig } from "../config.js";
+import { stripEip7708AssetDiffs } from "./eip7708.js";
 import { feeTokenHint } from "./feeCurrencies.js";
 import { resolveFeeToken, type FeeTokenOption } from "./feeTokenSelection.js";
 import { hasRawPrivateKey, type Signer } from "./signer.js";
@@ -75,8 +77,31 @@ export function buildRelayClient(network: NetworkConfig) {
   }
   return createClient({
     chain: network.chain,
-    transport: http(network.relayUrl, { timeout: 60_000 }),
+    transport: sanitizingHttp(network.relayUrl),
   });
+}
+
+/**
+ * The relay transport, with EIP-7708 system-address asset diffs removed before
+ * porto sees them.
+ *
+ * Every relay call in the SDK goes through `buildRelayClient`, and the client
+ * it returns is what is handed to `porto/viem/RelayActions`, so porto
+ * validates whatever this transport returns. Sanitising in the transport is
+ * therefore strictly before porto's schema check — which is the only place it
+ * can go, since porto rejects the whole response and never hands it back.
+ * See `eip7708.ts` for why the entries are dropped rather than relabelled.
+ */
+function sanitizingHttp(url: string): Transport {
+  const inner = http(url, { timeout: 60_000 });
+  return (params) => {
+    const transport = inner(params);
+    return {
+      ...transport,
+      request: async (args: Parameters<typeof transport.request>[0]) =>
+        stripEip7708AssetDiffs(await transport.request(args)),
+    };
+  };
 }
 
 export function buildPublicClient(network: NetworkConfig): PublicClient {
@@ -359,6 +384,16 @@ export type SubmitCallsOptions = {
    * from an L2 balance.
    */
   requiredFunds?: readonly RequiredFund[];
+  /**
+   * Skips this intent's first-action KeyStore registration.
+   *
+   * Set only by `submitRegistryWrite` when the calls it passes ARE that
+   * registration: a first-time registry write is two sequential intents, and
+   * the first one carries `initialRegisterKey` itself. Without this, the
+   * prepend fires on that intent too and registers the admin key twice in one
+   * intent, paying the fee twice.
+   */
+  skipFirstActionPrepend?: boolean;
   submittingKey: KeyDescriptor;
   authorizeKeys?: readonly KeyDescriptor[];
   revokeKeys?: readonly KeyDescriptor[];
@@ -467,9 +502,31 @@ export async function submitCallsDetailed(
 }
 
 /** What the relay would charge for an intent, without signing or sending it. */
+/** One leg of a quoted bundle: the relay quotes one per chain it will touch. */
+export type QuoteLeg = {
+  chainId?: number;
+  /** The gas budget for THIS leg, as signed. Compare a leg's need against this. */
+  combinedGas?: bigint;
+};
+
 export type CallsQuote = {
   /** Set when the relay quoted a second chain to fund this intent from: that chain. */
   fundedFromChainId?: number;
+  /**
+   * The gas budget the relay quoted, one entry per leg.
+   *
+   * This is what decides whether an intent fits: the relay bounds execution by
+   * it, and a call sequence needing more runs out of gas and reverts with no
+   * reason, which the Orchestrator reports as `CallError()` — naming neither
+   * gas nor the call. On 2026-10-07 that cost three escrowed runs and five
+   * revisions of the relay's intent buffer to establish a number the quote
+   * already contained.
+   *
+   * Deliberately not reduced to a scalar. There is no correct scalar: each leg
+   * carries its own buffer and is checked against its own budget, so "does this
+   * fit" is a per-leg question. Empty when the relay's quote carried no legs.
+   */
+  legs: readonly QuoteLeg[];
   /** Maximum fee the intent pays, in `feeToken` base units, summed over the relay's quotes. */
   fee: bigint;
   /** The token the relay is charging its fee in (the zero address is native). */
@@ -508,6 +565,7 @@ export async function quoteCalls(
   const fundedFromChainId = fundedFromChainIdOf(prepared, client.chain?.id);
   return {
     ...(fundedFromChainId !== undefined ? { fundedFromChainId } : {}),
+    legs: quoteLegsFromPrepared(prepared),
     fee,
     feeTokenDeficit,
     feeToken,
@@ -557,6 +615,30 @@ export function nativeNeededFromPrepared(
   }
   if (reported && fromRelay >= estimate) return { nativeNeeded: fromRelay, nativeNeededFromRelay: true };
   return { nativeNeeded: estimate, nativeNeededFromRelay: false };
+}
+
+/**
+ * The relay's quoted legs, each with its own gas budget.
+ *
+ * Per leg, never summed. The relay adds its buffer per intent
+ * (`relay src/types/simulator.rs:100`) and the Orchestrator evaluates the 63/64
+ * gas check per intent against that intent's own `combinedGas`
+ * (`Orchestrator.sol:331`), so a leg fits or starves on its own number. A sum
+ * can look comfortable while one leg starves, and an estimate derived by
+ * subtracting ONE buffer from a sum of two is wrong by a whole buffer — which
+ * is what made the same `registerKey` call appear to cost 7.6x more on one
+ * wallet than another (infra, 2026-10-15).
+ */
+export function quoteLegsFromPrepared(prepared: any): readonly QuoteLeg[] {
+  const quotes: any[] = prepared?.context?.quote?.quotes ?? [];
+  return quotes.map((q) => {
+    const g = q?.intent?.combinedGas;
+    const chainId = q?.chainId;
+    return {
+      ...(chainId !== undefined && chainId !== null ? { chainId: Number(chainId) } : {}),
+      ...(g !== undefined && g !== null && g !== "" ? { combinedGas: toBigInt(g) } : {}),
+    };
+  });
 }
 
 /** Reads the fee out of a prepareCalls response (porto decodes the quote's hex amounts). */
@@ -614,7 +696,7 @@ async function prepareIntent(
   // skipped here: the admin registers lazily on the registry chain inside the
   // wallet's first registry write (see submitRegistryCalls).
   let effectiveCalls: readonly Call[] = calls;
-  if (needsFirstActionPrepend(opts.network, opts.submittingKey.role)) {
+  if (!opts.skipFirstActionPrepend && needsFirstActionPrepend(opts.network, opts.submittingKey.role)) {
     const publicClient = buildPublicClient(opts.network);
     const prepend = await buildFirstActionPrepend({
       publicClient,

@@ -88,7 +88,30 @@ export type SessionLeg = {
   l1BlockNumber?: bigint;
   /** Cache legs: the cache entry after the proof, when one was read. */
   cachedKey?: CachedKey;
+  /**
+   * Registry legs: the first-time root registration, when the write needed one.
+   *
+   * A first registry write is two sequential intents, `initialRegisterKey` then
+   * `registerKey`, because the pair exceeds the gas one intent is quoted for.
+   * The leg's own fields always describe the SESSION write (`registerKey`), so
+   * `blockNumber` stays the block a cache proof must be anchored at or past;
+   * the root write's outcome lives here.
+   *
+   * `status: "CONFIRMED"` on a FAILED leg is the recoverable case: the root
+   * landed, so a retry of grantSession sends only `registerKey`.
+   */
+  rootRegistration?: RootRegistrationLeg;
   /** Why the leg was skipped or failed. */
+  reason?: string;
+};
+
+/** The root (`initialRegisterKey`) half of a first-time registry write. */
+export type RootRegistrationLeg = {
+  status: "CONFIRMED" | "FAILED";
+  transactionHash?: Hex;
+  blockNumber?: bigint;
+  /** Relay bundle id, on the relay path. */
+  callsId?: Hex;
   reason?: string;
 };
 
@@ -109,8 +132,19 @@ export type GrantLeg = SessionLeg;
  * Assignable to Session. Check `status` before handing the session to an agent.
  */
 export type GrantSessionResult = Session & {
-  /** The session's KeyStore keyId. */
+  /** The session's KeyStore keyId: `keccak(publicKey)`. */
   keyId: Hex;
+  /**
+   * The session's key hash **on the account**, which is what the account
+   * contract indexes keys by and what `getKey`/`Authorized` use.
+   *
+   * It is not the `keyId`: the KeyStore keys entries by `keccak(publicKey)`
+   * and the account by `keccak(abi.encode(keyType, keccak(encodedPublicKey)))`.
+   * Calling the account's `getKey` with a `keyId` reverts `KeyDoesNotExist()`
+   * whether or not the session is live, so checking a grant on-chain needs
+   * this value (`evidence/2026-10-15-demo-grant-did-authorize-on-celo.md`).
+   */
+  keyHash: Hex;
   status: "granted" | "failed";
   legs: GrantLeg[];
   /**
@@ -120,6 +154,18 @@ export type GrantSessionResult = Session & {
    * session usable; `syncSessionToCache` submits the proof later.
    */
   cacheSync: Promise<GrantLeg[]>;
+  /**
+   * The registry legs once the KeyStore registration has finished.
+   *
+   * On a network with a cached registry the account authorization goes first
+   * and the KeyStore write runs in the background, so its leg reads `PENDING`
+   * in `legs` at return and resolves here. Never rejects: a registration that
+   * fails is a `FAILED` leg here, and `onStatus("registry-write-failed")`
+   * reports it too. Resolves at once when no registration was deferred.
+   *
+   * The session is usable as soon as this call returns, registration or not.
+   */
+  registration: Promise<GrantLeg[]>;
 };
 
 /**
@@ -160,6 +206,13 @@ export type CacheSyncReport = {
 /** Progress of grantSession. Per-chain phases carry the chain in `detail`. */
 export type GrantSessionStatus =
   | "registry-write"
+  /**
+   * The background KeyStore registration did not confirm. `detail.reason`
+   * carries the relay's own words. The session is still live on the account:
+   * the account enforces the key locally, and the KeyStore entry is the public
+   * record of it, so this says "unverifiable by third parties", not "unusable".
+   */
+  | "registry-write-failed"
   | "account-authorization"
   | "cache-sync"
   | "done";
@@ -173,7 +226,18 @@ export type RevokeSessionStatus =
   | "done";
 
 /** The chain a per-chain progress event is about. */
-export type SessionStatusDetail = { chainId: number };
+export type SessionStatusDetail = {
+  chainId: number;
+  /**
+   * `registry-write` only, and only on a wallet's first registry write, which
+   * is two sequential intents: `root` is `initialRegisterKey`, `session` is
+   * `registerKey`. The event name is unchanged, so a consumer that ignores
+   * `step` simply sees `registry-write` twice, which is what happened.
+   */
+  step?: "root" | "session";
+  /** `registry-write-failed` only: why it failed, in the relay's words. */
+  reason?: string;
+};
 
 /** Options for grantSession. */
 export type GrantSessionOptions = {

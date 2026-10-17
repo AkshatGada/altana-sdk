@@ -11,7 +11,9 @@ import { formatUnits, keccak256, type Address, type Hex } from "viem";
 import { NATIVE_TOKEN, networkByChainId, type NetworkConfig } from "./config.js";
 import { planRegistryFunding, planRegistryWrite, keyStoreCacheOf } from "./internal/cachedRegistry.js";
 import { buildFirstActionPrepend, readActiveKeys, readPublicKey } from "./internal/keystore.js";
-import { buildPublicClient, buildRelayClient, quoteCalls, type Call, type CallsQuote } from "./internal/relay.js";
+import { buildPublicClient, buildRelayClient, quoteCalls, type Call, type CallsQuote,
+  type QuoteLeg,
+} from "./internal/relay.js";
 import { errorMessage, realSessionLegDeps, type SessionLegDeps } from "./internal/sessionLegs.js";
 import type { GrantSessionOptions, Session, SessionLeg } from "./internal/sessions.js";
 import type { Signer } from "./internal/signer.js";
@@ -45,6 +47,18 @@ export type QuoteLine = {
    * charged to the payer's balance there, not on `chainId`.
    */
   fundedFromChainId?: number;
+  /**
+   * Registry legs on a wallet's FIRST write: that write is two sequential
+   * intents, so `fee`, `value` and `needed` above are the sum of both, and this
+   * is the root (`initialRegisterKey`) intent's own share. Absent on every
+   * later write, which is one intent.
+   */
+  rootRegistration?: Pick<QuoteLine, "fee" | "feeToken" | "value" | "needed" | "neededFromRelay" | "fundedFromChainId">;
+  /**
+   * The relay's quoted legs with their gas budgets, per leg. What decides
+   * whether each fits; see `CallsQuote.legs`.
+   */
+  legs?: readonly QuoteLeg[];
   /** Why the fee could not be quoted. */
   reason?: string;
   /**
@@ -153,20 +167,44 @@ export function quotingDeps(base: SessionLegDeps = realSessionLegDeps): {
       };
       try {
         if (via === "relay") {
-          const requiredFunds = await planRegistryFunding({
-            registryClient: buildPublicClient(registry),
-            registry,
+          const registryClient = buildPublicClient(registry);
+          const relayClient = buildRelayClient(registry);
+          const quoteOne = async (calls: readonly Call[], isRoot = false) => {
+            const requiredFunds = await planRegistryFunding({
+              registryClient,
+              registry,
+              walletAddress: args.wallet.address,
+              adminPublicKey: args.adminSigner.publicKey,
+              calls,
+              ...(isRoot ? { skipFirstActionPrepend: true } : {}),
+            });
+            return quoteCalls(relayClient, args.wallet.address, args.adminSigner, calls, {
+              feeToken: NATIVE_TOKEN,
+              requiredFunds,
+              submittingKey: { type: "secp256k1", publicKey: args.adminSigner.publicKey, role: "admin" },
+              network: registry,
+              ...(isRoot ? { skipFirstActionPrepend: true } : {}),
+            });
+          };
+          // A wallet's first registry write is submitted as two sequential
+          // intents (see submitRegistryWrite), so it costs two fees and must be
+          // quoted as two. Quoting one would under-report the first-time path.
+          const prepend = await buildFirstActionPrepend({
+            publicClient: registryClient,
+            network: registry,
             walletAddress: args.wallet.address,
             adminPublicKey: args.adminSigner.publicKey,
-            calls: args.calls,
           });
-          const q = await quoteCalls(buildRelayClient(registry), args.wallet.address, args.adminSigner, args.calls, {
-            feeToken: NATIVE_TOKEN,
-            requiredFunds,
-            submittingKey: { type: "secp256k1", publicKey: args.adminSigner.publicKey, role: "admin" },
-            network: registry,
-          });
+          const q = await quoteOne(args.calls);
           Object.assign(line, pickQuote(q));
+          if (prepend.length > 0) {
+            const root = await quoteOne(prepend, true);
+            line.fee = q.fee + root.fee;
+            line.value = q.value + root.value;
+            line.needed = q.nativeNeeded + root.nativeNeeded;
+            line.neededFromRelay = q.nativeNeededFromRelay || root.nativeNeededFromRelay;
+            line.rootRegistration = pickQuote(root);
+          }
         } else {
           const plan = planRegistryWrite(registry, args.adminSigner, args.wallet.address);
           if (plan.via !== "eoa") throw new Error("unreachable: relay-less registry planned via relay");
@@ -298,8 +336,11 @@ export async function withBalances(
 }
 
 /** The quote fields a line keeps: fee, value, and the native amount needed. */
-function pickQuote(q: CallsQuote): Pick<QuoteLine, "fee" | "feeToken" | "value" | "needed" | "neededFromRelay" | "fundedFromChainId"> {
+function pickQuote(
+  q: CallsQuote,
+): Pick<QuoteLine, "fee" | "feeToken" | "value" | "needed" | "neededFromRelay" | "fundedFromChainId" | "legs"> {
   return {
+    ...(q.legs.length ? { legs: q.legs } : {}),
     fee: q.fee,
     feeToken: q.feeToken,
     value: q.value,

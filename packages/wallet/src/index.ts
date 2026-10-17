@@ -193,6 +193,10 @@ export {
   readL1Anchor,
   computeKeyPackedSlot,
 } from "./syncKeyToL2.js";
+export {
+  registrationValueFor,
+  REGISTRATION_FEE_MARGIN_PERCENT,
+} from "./internal/keystore.js";
 export type {
   SyncKeyToL2Args,
   SyncKeyToL2Result,
@@ -268,3 +272,5 @@ export type {
   RegisterAgentResult,
   SetAgentUriParams,
 } from "./erc8004.js";
+
+export { sdkBuild, type SdkBuild } from "./buildInfo.js";

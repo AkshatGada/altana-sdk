@@ -252,6 +252,82 @@ These packages are pre-1.0. Minor versions may contain breaking changes.
 
 ### Fixed
 
+- **A wallet's first session key registers reliably again.** That first
+  registry write is two KeyStore calls, `initialRegisterKey` then
+  `registerKey`, and they were bundled into one relayed intent.
+  `initialRegisterKey` alone costs about 1.08M gas on a cold account, which
+  left `registerKey` too little of the intent's budget: it ran out of gas and
+  the Orchestrator returned `CallError()`, surfacing as a failed
+  `grantSession` with nothing naming gas. The two calls now go as two
+  sequential intents, each quoted for its own gas. They do not need to be
+  atomic — the direct (no-relay) registry path has always sent one
+  transaction per call — and if the first lands and the second fails, a retry
+  of `grantSession` reads KeyStore, finds the admin key, and sends only
+  `registerKey`. `SessionLeg` gains an optional `rootRegistration` carrying
+  the first intent's outcome; the leg's own `transactionHash` and
+  `blockNumber` still describe the session key's write, so cache proofs
+  anchor where they did before. `onStatus("registry-write", detail)` now
+  carries `detail.step` of `"root"` or `"session"` on a first write; the
+  event name is unchanged, so a consumer ignoring `step` simply sees it
+  twice. `quoteSession` prices both intents and sums them, and a registry
+  line gains `rootRegistration` with the first intent's own share.
+
+- **A failed registry write says what went wrong.** The leg's `reason` was
+  `registry write status FAILED`, which named neither the chain's revert nor
+  the relay's message, both of which were available one layer down. It now
+  carries the write's own words.
+
+- **A registration fee quoted a moment ago is no longer refused at inclusion.**
+  `KeyStoreController.getRegistrationFeeInWei()` is oracle-priced — a USD fee
+  converted through Chainlink's ETH/USD feed — so the wei amount moves with
+  every oracle round, while the controller requires `msg.value >= fee` at
+  **inclusion**. A registration call now carries the quoted fee plus **10%**,
+  via the exported `registrationValueFor`, and `requiredFunds` and the quote
+  line follow it because both sum the calls' own `value`. Overpaying costs
+  nothing: the controller refunds the excess to `msg.sender` with a full-gas
+  `call`, which an EIP-7702 delegated account can receive, and the refund is
+  `require`d so a failure reverts loudly rather than keeping the change.
+  10% is sized against the measurement rather than the symptom: Chainlink
+  ETH/USD steps at most ~1.4% per round on Sepolia, so this is about six times
+  the worst step. It is deliberately not large enough to absorb a stale
+  payload, because that is a lifecycle problem rather than a pricing one —
+  `keystore_encode_register_key` now returns `quotedFeeWei` and `quotedAtBlock`
+  with it, so a caller can compare against `keystore_registration_quote` and
+  re-encode rather than send a payload built in an earlier oracle round.
+
+- **Mirror proofs work again after Glamsterdam.** Ethereum Sepolia's block
+  headers gained `blockAccessListHash` and `slotNumber` at block 11856337, so
+  the SDK's header RLP encoder no longer reproduced the block hash and
+  `buildPopulateKeyCall` refused to build any proof against a post-fork anchor
+  ("RLP header encoding does not hash to block hash; block schema likely
+  changed"). That guard was right and is why this was a readable diagnosis
+  rather than an on-chain revert. Both fields are now encoded, appended in that
+  order and **only when present**, so pre-fork headers and anything already in
+  a cache keep verifying — three of the four chains the SDK reads do not carry
+  them yet. The deployed `KeyStoreCacheOPStack` needed no change: it hashes the
+  header's raw bytes and reads `stateRoot` at index 3 with no field-count
+  check, confirmed by static call against the live contract. Existing cache
+  entries, `isValidKey` and session registration were never affected; only
+  building a new proof was.
+
+- **Sepolia works again after EIP-7708.** Ethereum Sepolia activated
+  Glamsterdam at block 11856337, and every ETH transfer now also emits a real
+  ERC-20 `Transfer` log from the system address
+  `0xfffffffffffffffffffffffffffffffffffffffe`. The relay builds `assetDiffs`
+  from simulation logs, so that log arrived as
+  `{"address":"0xff..fe","type":"erc20"}` with no `symbol` — the address has no
+  code, so the relay's `decimals()`/`symbol()`/`name()` multicall reverts and
+  those fields stay absent. Every variant of porto's asset-diff schema requires
+  a `symbol`, so porto rejected the **whole** response and every
+  `grantSession` registry leg on Sepolia failed. The SDK's relay transport now
+  removes those entries before porto validates, on every response that carries
+  `assetDiffs` (`wallet_prepareCalls` and `wallet_getCallsHistory`), dropping
+  an account's entry when the system address was its only diff. They are
+  dropped rather than relabelled because the relay synthesises its own native
+  diff from `0xee..ee`: the two logs describe one movement, so mapping the
+  system address onto the native asset would double every ETH balance change.
+  A response carrying no such entry is returned unchanged, by identity.
+
 - **A passkey wallet can be created on a cached-registry network.**
   `createWallet({ signer: passkey })` refused on Celo Sepolia and Base Sepolia
   with "signer produced a different address on chain 11155111". Those networks

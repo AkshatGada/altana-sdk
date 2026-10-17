@@ -15,6 +15,7 @@ import { buildRelayClient, SEPOLIA_FAUCET_URL, submitCallsDetailed, type KeyDesc
 import { submitRegistryWrite } from "./cachedRegistry.js";
 import { quoteExecute } from "../execute.js";
 import { quotingDeps } from "../quoteSession.js";
+import { registrationValueFor } from "./keystore.js";
 import capabilities from "./fixtures/celo-sepolia-capabilities.json" with { type: "json" };
 import prepared from "./fixtures/celo-sepolia-prepare-calls.json" with { type: "json" };
 
@@ -296,7 +297,20 @@ describe("registry write funded from the L2, on the wire", () => {
   const FEE = 200_000_000_000_000n;
 
   /** Plays the Sepolia relay and the Sepolia public RPC (KeyStore reads, balance). */
-  function mockRegistryWire(o: { balance: bigint; activeKeys: Hex[]; prepareError?: string; assets?: unknown }) {
+  function mockRegistryWire(o: {
+    balance: bigint;
+    activeKeys: Hex[];
+    prepareError?: string;
+    assets?: unknown;
+    /** Fails only the Nth (0-based) prepare, to break one intent of a pair. */
+    failPrepareAt?: number;
+    /** Reports the Nth (0-based) send as not confirmed. */
+    failStatusAt?: number;
+    /** The 17:22 shape: the source leg landed, the destination never ran. */
+    sourceReceiptOnly?: boolean;
+  }) {
+    let prepares = 0;
+    let sends = 0;
     const requests: Recorded[] = [];
     const same = (a: string, b: string | undefined) => b !== undefined && a.replace(/\/$/, "") === b.replace(/\/$/, "");
     globalThis.fetch = (async (url: any, init?: RequestInit) => {
@@ -322,6 +336,9 @@ describe("registry write funded from the L2, on the wire", () => {
           // Every registry write is paid from the L2: a request without the funds is a test failure.
           if (!req.params[0].capabilities?.requiredFunds)
             return { jsonrpc: "2.0", id: req.id, error: { code: -32603, message: "test relay: registry write sent without requiredFunds" } };
+          const nth = prepares++;
+          if (o.failPrepareAt === nth)
+            return { jsonrpc: "2.0", id: req.id, error: { code: 3, message: "intent reverted: 0x", data: "0x" } };
           return o.prepareError ? { jsonrpc: "2.0", id: req.id, error: { code: 3, message: o.prepareError, data: "0x" } } : ok(prepared);
         }
         if (req.method === "wallet_getAssets") return ok(o.assets ?? {});
@@ -329,8 +346,20 @@ describe("registry write funded from the L2, on the wire", () => {
         if (req.method === "wallet_getCallsStatus")
           return ok({
             id: "0xabc",
-            status: 200,
-            receipts: [
+            status: o.failStatusAt === sends++ ? 500 : 200,
+            receipts: (o.sourceReceiptOnly
+              ? [
+                  {
+                    chainId: numberToHex(CELO_SEPOLIA.chainId),
+                    blockNumber: "0x10",
+                    blockHash: "0x" + "11".repeat(32),
+                    gasUsed: "0x73c17",
+                    status: "0x1",
+                    transactionHash: CELO_TX,
+                    logs: [],
+                  },
+                ]
+              : undefined) ?? [
               { chainId: numberToHex(CELO_SEPOLIA.chainId), blockNumber: "0x10", blockHash: "0x" + "11".repeat(32), gasUsed: "0x5208", status: "0x1", transactionHash: CELO_TX, logs: [] },
               { chainId: numberToHex(SEPOLIA.chainId), blockNumber: "0xb2944d", blockHash: "0x" + "22".repeat(32), gasUsed: "0x5208", status: "0x1", transactionHash: SEPOLIA_TX, logs: [] },
             ],
@@ -352,7 +381,11 @@ describe("registry write funded from the L2, on the wire", () => {
   // do with funding.
   test("a wallet that can clearly pay: the bare revert is not dressed up as a shortfall", async () => {
     const signer = createPrivateKeySigner();
-    const held = 5n * 10n ** 16n; // 0.05 ETH, against 0.0004 ETH of fees
+    // 0.05 ETH held, against the 0.00022 ETH the ROOT intent sends. A first
+    // registry write is two sequential intents and the first one carries only
+    // the margined admin registration, so this is the intent that reverts and
+    // the message describes it, not the pair.
+    const held = 5n * 10n ** 16n;
     mockRegistryWire({
       balance: held,
       activeKeys: [],
@@ -371,9 +404,11 @@ describe("registry write funded from the L2, on the wire", () => {
       () => undefined,
       (e: unknown) => String((e as Error).message),
     );
+    expect(thrown).toContain("The root registration (initialRegisterKey) could not be submitted");
     expect(thrown).toContain("its simulation reverted with no reason on Sepolia (chainId 11155111)");
+    expect(thrown).toContain("simulating 1 call");
     expect(thrown).toContain("the wallet's balance is not the cause: it holds 0.05 ETH on Sepolia");
-    expect(thrown).toContain("more than the 0.0004 ETH the calls send");
+    expect(thrown).toContain("more than the 0.00022 ETH the calls send");
     expect(thrown).not.toContain("cannot pay");
     expect(thrown).not.toContain("does not cover");
     expect(thrown).not.toContain(SEPOLIA_FAUCET_URL);
@@ -390,7 +425,8 @@ describe("registry write funded from the L2, on the wire", () => {
         [numberToHex(CELO_SEPOLIA.chainId)]: [{ address: "native", balance: "0x0", type: "native", metadata: { symbol: "CELO", decimals: 18 } }],
       },
     });
-    // Both registration fees: the admin key is registered in the same intent.
+    // The ROOT intent's message: one call, the margined admin registration
+    // (0.00022). The session key's registerKey is never attempted.
     await expect(
       submitRegistryWrite(SEPOLIA, {
         walletAddress: signer.address,
@@ -398,15 +434,17 @@ describe("registry write funded from the L2, on the wire", () => {
         calls: [{ to: SEPOLIA.keyStoreController, value: FEE, data: "0x" }],
       }),
     ).rejects.toThrow(
-      "The relay rejected the request to prepare the call: its simulation reverted with no reason on Sepolia " +
-        `(chainId 11155111), simulating 2 calls to ${SEPOLIA.keyStoreController}, sending 0.0004 ETH; ` +
-        "the wallet cannot pay for it: it holds 0 ETH on Sepolia and needs 0.0004 ETH the calls send plus the " +
+      "The root registration (initialRegisterKey) could not be submitted, so the session key's " +
+        "registerKey was not attempted. " +
+        "The relay rejected the request to prepare the call: its simulation reverted with no reason on Sepolia " +
+        `(chainId 11155111), simulating 1 call to ${SEPOLIA.keyStoreController}, sending 0.00022 ETH; ` +
+        "the wallet cannot pay for it: it holds 0 ETH on Sepolia and needs 0.00022 ETH the calls send plus the " +
         "relay fee; it holds nothing on any other chain the relay could fund it from; fund it at " +
         `${SEPOLIA_FAUCET_URL} (relay: intent reverted: 0x)`,
     );
   });
 
-  test("a wallet with no ETH on Sepolia asks the relay to front both registration fees, paid in native", async () => {
+  test("a wallet with no ETH on Sepolia asks the relay to front each registration fee, paid in native", async () => {
     const signer = createPrivateKeySigner();
     const wire = mockRegistryWire({ balance: 0n, activeKeys: [] });
     const written = await submitRegistryWrite(SEPOLIA, {
@@ -414,10 +452,22 @@ describe("registry write funded from the L2, on the wire", () => {
       adminSigner: signer,
       calls: [{ to: SEPOLIA.keyStoreController, value: FEE, data: "0x" }],
     });
-    const p = wire.prepare();
-    expect(p.capabilities.requiredFunds).toEqual([{ address: NATIVE_TOKEN, value: numberToHex(FEE * 2n) }]);
-    expect(wire.prepares()).toHaveLength(1);
-    expect(String(p.capabilities.meta.feeToken).toLowerCase()).toBe(NATIVE_TOKEN);
+    // Two intents, each asking the relay to front its OWN value. Indexed
+    // rather than read through `wire.prepare()`, which returns the first and
+    // would silently be the root intent wherever the session one was meant.
+    const [root, session] = wire.prepares();
+    expect(wire.prepares()).toHaveLength(2);
+    // The root intent carries the margined admin registration only.
+    expect(root.capabilities.requiredFunds).toEqual([
+      { address: NATIVE_TOKEN, value: numberToHex(registrationValueFor(FEE)) },
+    ]);
+    // The session intent carries the hand-built call's bare FEE.
+    expect(session.capabilities.requiredFunds).toEqual([{ address: NATIVE_TOKEN, value: numberToHex(FEE) }]);
+    expect(String(root.capabilities.meta.feeToken).toLowerCase()).toBe(NATIVE_TOKEN);
+    expect(String(session.capabilities.meta.feeToken).toLowerCase()).toBe(NATIVE_TOKEN);
+    // The root's outcome is reported, and the result's own fields stay the
+    // session write's: a cache proof anchors on the session key's block.
+    expect(written.rootRegistration?.status).toBe("CONFIRMED");
     expect(written.status).toBe("CONFIRMED");
     expect(written.transactionHash).toBe(SEPOLIA_TX);
     expect(written.blockNumber).toBe(11703373n);
@@ -441,7 +491,153 @@ describe("registry write funded from the L2, on the wire", () => {
     expect(written.transactionHash).toBe(SEPOLIA_TX);
   });
 
-  test("some ETH, less than value plus fee: funded in one request, the case the relay used to be left with", async () => {
+  // The pair exceeds what one intent is quoted for: initialRegisterKey alone
+  // costs 1,077,101 gas cold at the 1,500,000 intent buffer, leaving
+  // registerKey 44,555 and an out-of-gas CallError() (infra, 2026-10-07). Two
+  // sequential intents, each quoted for its own gas.
+  test("a first-time write is two intents: the root alone, then the session key alone", async () => {
+    const signer = createPrivateKeySigner();
+    const wire = mockRegistryWire({ balance: 0n, activeKeys: [] });
+    await submitRegistryWrite(SEPOLIA, {
+      walletAddress: signer.address,
+      adminSigner: signer,
+      calls: [{ to: SEPOLIA.keyStoreController, value: FEE, data: "0x" }],
+    });
+    const [root, session] = wire.prepares();
+    // One call each. Two would mean the registration was prepended on top of
+    // itself, paying its fee twice — which is what happens if either the
+    // submit or the funding path re-derives the prepend for these intents.
+    expect(root.calls).toHaveLength(1);
+    expect(session.calls).toHaveLength(1);
+    // The root's call is the margined admin registration; the session's is the
+    // caller's own call, carrying the bare fee it was built with.
+    expect(BigInt(root.calls[0].value)).toBe(registrationValueFor(FEE));
+    expect(BigInt(session.calls[0].value)).toBe(FEE);
+  });
+
+  // A lagging or load-balanced registry RPC can still answer `getKeys() == []`
+  // right after the root intent confirms. If the session intent asked the chain
+  // whether to prepend, it would prepend again there and pay the fee twice. The
+  // static `activeKeys: []` in this mock IS that stale read, so this test fails
+  // if the session intent ever goes back to deriving its own prepend.
+  test("the session intent does not re-derive the prepend from a stale registry read", async () => {
+    const signer = createPrivateKeySigner();
+    const wire = mockRegistryWire({ balance: 0n, activeKeys: [] });
+    await submitRegistryWrite(SEPOLIA, {
+      walletAddress: signer.address,
+      adminSigner: signer,
+      calls: [{ to: SEPOLIA.keyStoreController, value: FEE, data: "0x" }],
+    });
+    const session = wire.prepares()[1];
+    expect(session.calls).toHaveLength(1);
+    expect(session.capabilities.requiredFunds).toEqual([{ address: NATIVE_TOKEN, value: numberToHex(FEE) }]);
+  });
+
+  test("a write that is not a wallet's first is still one intent", async () => {
+    const signer = createPrivateKeySigner();
+    const wire = mockRegistryWire({ balance: 10n ** 18n, activeKeys: [("0x" + "01".repeat(32)) as Hex] });
+    const written = await submitRegistryWrite(SEPOLIA, {
+      walletAddress: signer.address,
+      adminSigner: signer,
+      calls: [{ to: SEPOLIA.keyStoreController, value: FEE, data: "0x" }],
+    });
+    expect(wire.prepares()).toHaveLength(1);
+    expect(written.rootRegistration).toBeUndefined();
+  });
+
+  test("the root failing stops the session key's write, and says so", async () => {
+    const signer = createPrivateKeySigner();
+    const wire = mockRegistryWire({ balance: 0n, activeKeys: [], failPrepareAt: 0 });
+    const thrown = await submitRegistryWrite(SEPOLIA, {
+      walletAddress: signer.address,
+      adminSigner: signer,
+      calls: [{ to: SEPOLIA.keyStoreController, value: FEE, data: "0x" }],
+    }).then(
+      () => undefined,
+      (e: unknown) => String((e as Error).message),
+    );
+    expect(thrown).toContain("The root registration (initialRegisterKey) could not be submitted");
+    expect(thrown).toContain("the session key's registerKey was not attempted");
+    // And it really was not attempted: only the root was ever prepared.
+    expect(wire.prepares()).toHaveLength(1);
+  });
+
+  test("the root landing and the session failing is reported as recoverable", async () => {
+    const signer = createPrivateKeySigner();
+    // The second send is the session intent; the first is the root.
+    const wire = mockRegistryWire({ balance: 0n, activeKeys: [], failStatusAt: 1 });
+    const written = await submitRegistryWrite(SEPOLIA, {
+      walletAddress: signer.address,
+      adminSigner: signer,
+      calls: [{ to: SEPOLIA.keyStoreController, value: FEE, data: "0x" }],
+    });
+    // Binary: the write as a whole failed. The detail says what survived.
+    expect(written.status).toBe("FAILED");
+    expect(written.rootRegistration?.status).toBe("CONFIRMED");
+    expect(written.reason).toContain("The root registration DID confirm");
+    expect(written.reason).toContain("retrying grantSession sends registerKey only");
+    expect(wire.prepares()).toHaveLength(2);
+  });
+
+  // "relay reported status FAILED" named nothing: a reader could not tell an
+  // intent that never landed from one that landed and reverted, which are
+  // different investigations. The spine printed exactly that string for the
+  // root failure on 2026-10-07 and it cost a run to learn nothing.
+  test("a root failure names the bundle, the status code and the receipts", async () => {
+    const signer = createPrivateKeySigner();
+    mockRegistryWire({ balance: 0n, activeKeys: [], failStatusAt: 0 });
+    const written = await submitRegistryWrite(SEPOLIA, {
+      walletAddress: signer.address,
+      adminSigner: signer,
+      calls: [{ to: SEPOLIA.keyStoreController, value: FEE, data: "0x" }],
+    });
+    expect(written.status).toBe("FAILED");
+    const reason = written.rootRegistration?.reason ?? "";
+    expect(reason).toContain("bundle 0xabc");
+    expect(reason).toContain("statusCode 500");
+    // The receipts the relay did return, per chain, so a reverted intent is
+    // distinguishable from one that never landed.
+    expect(reason).toContain(`chain ${SEPOLIA.chainId}`);
+    expect(reason).toContain(SEPOLIA_TX);
+  });
+
+  // infra's trace of the real 17:22 bundle: status 300, ONE receipt, on Celo
+  // (the source), succeeded, and no Sepolia receipt. My first version of this
+  // message had two branches, "no receipt" and "receipt, reverted", and this
+  // is neither: there is a successful receipt and the registry chain has no
+  // transaction at all. It also leaves a funded escrow open, which is how four
+  // of them accumulated.
+  test("a source leg that landed with no destination receipt is its own case", async () => {
+    const signer = createPrivateKeySigner();
+    mockRegistryWire({ balance: 0n, activeKeys: [], failStatusAt: 0, sourceReceiptOnly: true });
+    const written = await submitRegistryWrite(SEPOLIA, {
+      walletAddress: signer.address,
+      adminSigner: signer,
+      calls: [{ to: SEPOLIA.keyStoreController, value: FEE, data: "0x" }],
+    });
+    const reason = written.rootRegistration?.reason ?? "";
+    expect(reason).toContain(`chain ${CELO_SEPOLIA.chainId}: succeeded`);
+    expect(reason).toContain(`nothing was mined on the registry chain (${SEPOLIA.chainId})`);
+    expect(reason).toContain("escrow");
+    // Not the no-receipt branch: there IS one, and saying otherwise sends the
+    // reader to the relay when a successful source transaction exists.
+    expect(reason).not.toContain("no receipt at all");
+  });
+
+  test("each intent reports its own step, in order", async () => {
+    const signer = createPrivateKeySigner();
+    mockRegistryWire({ balance: 0n, activeKeys: [] });
+    const steps: string[] = [];
+    await submitRegistryWrite(SEPOLIA, {
+      walletAddress: signer.address,
+      adminSigner: signer,
+      calls: [{ to: SEPOLIA.keyStoreController, value: FEE, data: "0x" }],
+      onStep: (step) => steps.push(step),
+    });
+    expect(steps).toEqual(["root", "session"]);
+  });
+
+  test("some ETH, less than value plus fee: one request per intent, no retry", async () => {
     const signer = createPrivateKeySigner();
     const wire = mockRegistryWire({ balance: 20n * FEE, activeKeys: [] });
     const written = await submitRegistryWrite(SEPOLIA, {
@@ -449,8 +645,14 @@ describe("registry write funded from the L2, on the wire", () => {
       adminSigner: signer,
       calls: [{ to: SEPOLIA.keyStoreController, value: FEE, data: "0x" }],
     });
-    expect(wire.prepares()).toHaveLength(1);
-    expect(wire.prepare().capabilities.requiredFunds).toEqual([{ address: NATIVE_TOKEN, value: numberToHex(20n * FEE + 1n) }]);
+    // The property this test is about is that no intent is prepared twice: the
+    // relay used to be left to discover the shortfall itself and the fix asked
+    // for the funding up front. A first-time write is two intents, so two
+    // prepares is one each — still no retry.
+    expect(wire.prepares()).toHaveLength(2);
+    for (const p of wire.prepares()) {
+      expect(p.capabilities.requiredFunds).toEqual([{ address: NATIVE_TOKEN, value: numberToHex(20n * FEE + 1n) }]);
+    }
     expect(written.status).toBe("CONFIRMED");
     expect(written.fundedFromChainId).toBe(CELO_SEPOLIA.chainId);
   });
