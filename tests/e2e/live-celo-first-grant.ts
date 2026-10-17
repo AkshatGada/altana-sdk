@@ -44,6 +44,7 @@ import {
   signerFromPrivateKey,
   waitForBalance,
   type GrantLeg,
+  sdkBuild,
   type NetworkConfig,
   type Session,
 } from "@altananetwork/sdk";
@@ -134,6 +135,17 @@ const record: Record<string, unknown> = { relay: RELAY, startedAt: new Date().to
 async function main() {
   console.log("LIVE: Celo-first grant, session used before the Sepolia registration");
   console.log("====================================================================\n");
+
+  // Which code this run actually ran. The e2e imports the BUILT package, so a
+  // stale `dist/` silently exercises the previous version: one run of this
+  // script reported a clean result for a gate that was not in the build
+  // (2026-10-07-what-code-a-spine-run-ran.md is the same failure). A run that
+  // does not state its own code cannot be used as evidence about that code.
+  console.log(`sdk build ${sdkBuild.describe}`);
+  record.sdkBuild = sdkBuild.describe;
+  if (sdkBuild.dirty) {
+    console.log("  (dirty tree: run `bun run --cwd packages/wallet build` if you changed src since)");
+  }
 
   const funderKey = process.env.TEST_FUNDER_KEY as Hex;
   if (!funderKey) throw new Error("Set TEST_FUNDER_KEY: source the shared .env.testnet first.");
@@ -315,11 +327,19 @@ async function main() {
   // can well land before an execute that only starts once grantSession has
   // returned. What the change guarantees is that the AUTHORIZATION never waited
   // for it, which the PENDING leg at return already showed.
+  // Two different reasons the registration can land first, and naming the
+  // wrong one is worse than naming none: either the write was quick (a single
+  // `registerKey` on an already-rooted wallet takes about 13s, less than this
+  // SDK's own catch-up sleep), or the execute was HELD until the write
+  // finished, which is what `executeBlockedSeconds` distinguishes.
+  const blocked = record.executeBlockedSeconds as number;
   const order =
     registered.unix > executed.unix
       ? `the registration landed AFTER the execute, +${registered.unix - executed.unix}s`
-      : `the registration landed ${executed.unix - registered.unix}s BEFORE the execute ` +
-        `(a fast single-intent write, not a wait the session paid for)`;
+      : `the registration landed ${executed.unix - registered.unix}s BEFORE the execute, ` +
+        (blocked >= 10
+          ? `because the execute was held ${blocked}s waiting for it (the pending-intent hold)`
+          : `because the write was quick; the execute was not held (${blocked}s)`);
   console.log(`    ${order}`);
   record.order = order;
   assert(await isRegistered(wallet.address, grant.keyId), "and the key is valid in the KeyStore now");
