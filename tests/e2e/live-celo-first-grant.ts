@@ -255,9 +255,11 @@ async function main() {
   // ── 2. The session acts, while the registration is in flight. ──
   console.log("\n[2] execute with the SESSION key, registration still in flight");
   const session = grant as unknown as Session;
-  // The SDK holds the caller off this L2 while the registration has an intent
-  // of its own in flight there, so this call is expected to BLOCK and then go.
-  // How long it blocks is the cost of that hold, and it is the number to watch.
+  // Timed, because the number is the finding either way. Doris's rule is that
+  // this call must NOT wait for the registration, so it should be the cost of
+  // one intent (about 5s) and never the length of the write. A hold that was
+  // tried and removed (option A, 2026-10-17) made it 45.3s, which is why this
+  // stays instrumented.
   const calledAt = Date.now();
   console.log(`    ${at()} calling execute`);
   const exec = await executeProbe(client, session, funder.address, grant.keyHash);
@@ -366,10 +368,18 @@ async function main() {
 
   await sweep(wallet.address, adminKey, funder.address);
 
-  record.verdict = "PASS: the session acted on Celo before its Sepolia registration confirmed";
+  // Read off the run rather than asserted: whether the execute beat the
+  // registration depends on how fast the relay was, and a fixed verdict string
+  // said "acted before its registration" for a run where it demonstrably did
+  // not (the 2026-10-17 hold run).
+  record.verdict =
+    `PASS: the session executed ${blocked}s after the call, ` +
+    (registered.unix > executed.unix
+      ? `before its Sepolia registration confirmed`
+      : `and its Sepolia registration had already confirmed ${executed.unix - registered.unix}s earlier`);
   writeFileSync(runFile(), `${JSON.stringify(record, null, 2)}\n`);
   console.log("\n====================================================================");
-  console.log("Result: PASS — the session acted on Celo before its Sepolia registration confirmed.");
+  console.log(`Result: ${record.verdict}`);
 }
 
 /**

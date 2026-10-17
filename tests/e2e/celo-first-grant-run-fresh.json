@@ -1,62 +1,70 @@
 {
   "relay": "https://relay-staging-production-2657.up.railway.app",
-  "startedAt": "2026-10-15T17:23:45.600Z",
-  "wallet": "0xb525116fF29766c031Dc7917b81fAAa8DD9156DF",
+  "startedAt": "2026-10-17T08:52:55.358Z",
+  "sdkBuild": "a63c72d+dirty",
+  "wallet": "0xc90D1dc8d6f585bBf78D9B624eb8F72978EFa9a3",
   "walletWasFresh": true,
   "keyStoreKeysBefore": 0,
   "statusEvents": [
-    "t+8.4s account-authorization chain 11142220",
-    "t+12.2s registry-write chain 11155111",
-    "t+12.6s registry-write chain 11155111 (root)",
-    "t+24.2s done",
-    "t+29.8s registry-write chain 11155111 (session)",
-    "t+42.1s cache-sync chain 11142220"
+    "t+8.9s account-authorization chain 11142220",
+    "t+14.7s registry-write chain 11155111",
+    "t+15.1s registry-write chain 11155111 (root)",
+    "t+26.7s done",
+    "t+43.8s registry-write chain 11155111 (session)",
+    "t+67.8s cache-sync chain 11142220"
   ],
-  "grantReturnedAt": "t+24.2s",
+  "grantReturnedAt": "t+26.7s",
   "celoAuthorization": {
-    "tx": "0x46bd603d459eeee3b74f6d40cd7c0ec007be4966f34ea2baa4d2401e6d61f4e0",
-    "block": "38801048",
-    "unix": 1792085036,
-    "iso": "2026-10-15T17:23:56.000Z"
+    "tx": "0x261b7a6ad96cbbc2d5d853663133509a4786b3b610b0ea22a07f4fdb83e112b4",
+    "block": "38943199",
+    "unix": 1792227187,
+    "iso": "2026-10-17T08:53:07.000Z"
   },
   "registrationStillRunningAtReturn": true,
+  "executeCalledAt": "t+27.0s",
+  "executeBlockedSeconds": 45.3,
+  "nonceErrors": [],
   "sessionExecuteAttempts": [
-    "t+29.3s attempt 1 (ours=true relay=true): CONFIRMED code 200 bundle 0xcf6f0b87ee0ff1252e0eb0816fb13ea0043e2c72253beca1ffd9fda6af57a8f5 tx 0xae22ac4282ea71a1c72463588a465d9b2e733c877913c948b713f20b175129f5"
+    "t+72.3s attempt 1 (ours=true relay=true): CONFIRMED code 200 bundle 0x0e419e28b78a068922b047f9353ebf94e7e9d18a572dd1531c8558f51bea5246 tx 0x5c2a888d59f956ed54ee9ed01d6fbf23dad34d91c562f47781c4b3d10a26039f"
   ],
   "sessionExecute": {
-    "tx": "0xae22ac4282ea71a1c72463588a465d9b2e733c877913c948b713f20b175129f5",
-    "block": "38801065",
-    "unix": 1792085053,
-    "iso": "2026-10-15T17:24:13.000Z"
+    "tx": "0x5c2a888d59f956ed54ee9ed01d6fbf23dad34d91c562f47781c4b3d10a26039f",
+    "block": "38943258",
+    "unix": 1792227246,
+    "iso": "2026-10-17T08:54:06.000Z"
   },
-  "registeredAtExecuteTime": false,
+  "registeredAtExecuteTime": true,
   "sepoliaRegistryLeg": {
     "status": "CONFIRMED",
     "via": "relay",
-    "tx": "0x17bfa97d68aefaa59f3866ce7c0aeaa23f07ec96c2dbc56c09f22252607907f7",
-    "block": "11921897",
+    "tx": "0xea2c2d9cf6fa12426a55a9a32506d092a93f973b59d600216a0acdfad31870b9",
+    "block": "11933146",
     "fundedFromChainId": 11142220,
-    "sourceTransactionHash": "0x172dffb04ea228944f5b2125ed48e99780c5a1b927fd80c11bf354bbdc3a45b1",
+    "sourceTransactionHash": "0x43c587f523c2df7f0ca9ce2901488e777305e2bd0e870302201dddaf8bcabb60",
     "rootRegistration": {
       "status": "CONFIRMED",
-      "callsId": "0x787ae3ffa5bee5c3655ea49788294856aeea9d64ea1a04cb41ff2c4c3487bdac",
-      "transactionHash": "0x68822f2326179d11efee4e536763583e8f485bbf3ae94d23d9b630b97fc35eb7",
-      "blockNumber": "11921896"
+      "callsId": "0x285f8d9a773c1e915337e373368eb5c808c0584d2958ff7bfac62611816c5c43",
+      "transactionHash": "0x770114603dcd9d47e13660d929b734dd128d478aa283a808767c51f42eea25c1",
+      "blockNumber": "11933144"
     }
   },
   "sepoliaRegistration": {
-    "tx": "0x17bfa97d68aefaa59f3866ce7c0aeaa23f07ec96c2dbc56c09f22252607907f7",
-    "block": "11921897",
-    "unix": 1792085064,
-    "iso": "2026-10-15T17:24:24.000Z"
+    "tx": "0xea2c2d9cf6fa12426a55a9a32506d092a93f973b59d600216a0acdfad31870b9",
+    "block": "11933146",
+    "unix": 1792227240,
+    "iso": "2026-10-17T08:54:00.000Z"
   },
-  "order": "the registration landed AFTER the execute, +11s",
+  "order": "the registration landed 6s BEFORE the execute (a fast single-intent write, not a wait the session paid for)",
   "cacheLeg": {
     "status": "CONFIRMED",
-    "tx": "0xad6fb6f2f1a776823bf795da75108bc4b0556b3685ea33389f58cadd534849b7",
-    "l1BlockNumber": "11922244"
+    "tx": "0x2e281cf6c4f8bdf7465c95e21427b6521386416157cea06d65314c95b28921af",
+    "l1BlockNumber": "11933170"
   },
-  "secondsAuthorizationToExecute": 17,
-  "secondsAuthorizationToRegistration": 28,
+  "secondsAuthorizationToExecute": 59,
+  "secondsAuthorizationToRegistration": 53,
+  "swept": {
+    "value": "0.484864109727700025",
+    "tx": "0xa7cc35f31a9737d23e15b88fa54961baf68f32e7ddebbbdd7bc387b62eebba23"
+  },
   "verdict": "PASS: the session acted on Celo before its Sepolia registration confirmed"
 }

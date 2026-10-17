@@ -13,7 +13,6 @@ import { buildSetCheckerApprovalCall } from "./approveSignatureChecker.js";
 import { buildApproveTokenForPermit2Call } from "./approveTokenForPermit2.js";
 import { PERMIT2_ADDRESS } from "./internal/x402Rails.js";
 import { isCachedRegistry } from "./internal/cachedRegistry.js";
-import { holdPendingIntent } from "./internal/pendingIntents.js";
 import { fetchFeeCurrencies, type FeeCurrency } from "./internal/feeCurrencies.js";
 import { addFeeSpendCaps, feeTokenList } from "./internal/feeTokenSelection.js";
 import {
@@ -321,17 +320,6 @@ export async function runGrantSession(
       }
       return runWrite(r);
     })();
-
-    // Hold the caller off these L2s until the write is done. The write pays
-    // for the L1 registration with an intent from the wallet's own account on
-    // one of them, and an `execute` prepared alongside it would read the same
-    // nonce (the relay reserves none for an unmined intent). Opened now rather
-    // than when the write starts, because the authorization that gates it is
-    // itself an intent on the same account.
-    //
-    // Released when the write settles either way: a registration that failed
-    // has nothing left in flight to collide with, so the execute should go.
-    for (const n of first) holdPendingIntent(n.chainId, wallet.address, write);
 
     registryDone.set(
       r.chainId,
