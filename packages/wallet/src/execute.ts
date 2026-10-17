@@ -2,6 +2,7 @@ import type { Address, Hex } from "viem";
 import { type NetworkConfig } from "./config.js";
 import { type Signer } from "./internal/signer.js";
 import {
+  buildPublicClient,
   buildRelayClient,
   quoteCalls,
   submitCallsDetailed,
@@ -13,6 +14,7 @@ import {
 } from "./internal/relay.js";
 import type { ExecuteResult, Wallet } from "./internal/types.js";
 import type { Session } from "./internal/sessions.js";
+import { withAppLaneNonce } from "./internal/appNonceLane.js";
 
 export type ExecuteOptions = {
   /** Which chain to run on. Resolved by the client from a chainId. */
@@ -120,16 +122,24 @@ export async function executeWithReceipts(
         role: "admin",
       };
 
-  const { callsId, feeToken } = await submitCallsDetailed(
-    relayClient,
-    walletAddress,
-    signer,
-    userCalls,
-    {
-      ...(opts.feeToken ? { feeToken: opts.feeToken } : {}),
-      submittingKey,
-      network,
-    },
+  // An app transaction runs on a lane of the SDK's own, so it never contends
+  // for a nonce with the relay's background work on lane 0 -- a grant's
+  // KeyStore registration pays for the L1 write with an intent from this same
+  // account, and the relay reserves no nonce for one it has not mined
+  // (evidence/2026-10-17-nonce-lanes.md). `withAppLaneNonce` also queues this
+  // wallet's own back-to-back transactions, because a lane's counter is
+  // sequential: handing out two at once would move the collision, not remove
+  // it. It passes `undefined` for a wallet that is not delegated yet, where
+  // there is no account to ask and the relay's own choice is the right one.
+  const { callsId, feeToken } = await withAppLaneNonce(
+    { publicClient: buildPublicClient(network), wallet: walletAddress, chainId: network.chainId },
+    (nonce) =>
+      submitCallsDetailed(relayClient, walletAddress, signer, userCalls, {
+        ...(opts.feeToken ? { feeToken: opts.feeToken } : {}),
+        ...(nonce !== undefined ? { nonce } : {}),
+        submittingKey,
+        network,
+      }),
   );
   const charged = feeToken ? { feeToken } : {};
 
