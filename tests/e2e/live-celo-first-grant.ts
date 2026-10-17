@@ -53,6 +53,7 @@ import {
   formatEther,
   http,
   parseEther,
+  parseGwei,
   type Address,
   type Hex,
   type PublicClient,
@@ -501,24 +502,32 @@ function isRegistered(wallet: Address, keyId: Hex): Promise<boolean> {
   }).catch(() => false) as Promise<boolean>;
 }
 
-/** Returns what is left to the funder. Best effort, logged, never throws. */
+/**
+ * Returns what is left to the funder. Best effort, logged, never throws.
+ *
+ * A plain EOA transfer, not a relayed intent: the relay's fee at the 1,500,000
+ * buffer is about 0.3 CELO, which can exceed what is left after the run, and a
+ * relayed sweep then fails with "quote has asset deficits" and strands the
+ * balance. 21,000 gas costs about 0.0015. The wallet is a delegated EOA, so it
+ * can still send an ordinary transaction signed by the admin key.
+ */
 async function sweep(wallet: Address, adminKey: Hex, funder: Address) {
   console.log("\n[sweep] return leftover funds to the funder");
-  const admin = signerFromPrivateKey(adminKey);
-  const client = createClient({ chains: [network] });
   try {
+    const account = privateKeyToAccount(adminKey);
     const bal = await pub.getBalance({ address: wallet });
-    const keep = parseEther("0.05");
-    if (bal > keep) {
-      const r = await client.execute({
-        wallet: { address: wallet },
-        signer: admin,
-        calls: { to: funder, value: bal - keep, data: "0x" },
-      });
-      console.log(`    returned ${formatEther(bal - keep)} CELO (${r.status})`);
-    } else {
-      console.log(`    ${formatEther(bal)} CELO left, below the ${formatEther(keep)} fee reserve; nothing returned`);
+    const gasPrice = parseGwei("70");
+    const cost = 21_000n * gasPrice;
+    if (bal <= cost * 2n) {
+      console.log(`    ${formatEther(bal)} CELO left, at or below the gas it would cost; left in place`);
+      return;
     }
+    const value = bal - cost;
+    const w = createWalletClient({ account, chain: celoSepolia, transport: http(network.publicRpcUrl) });
+    const hash = await w.sendTransaction({ to: funder, value, gas: 21_000n, gasPrice });
+    await pub.waitForTransactionReceipt({ hash });
+    console.log(`    returned ${formatEther(value)} CELO  ${hash}`);
+    record.swept = { value: formatEther(value), tx: hash };
   } catch (e) {
     console.log(`    CELO sweep failed: ${(e as Error).message.split("\n")[0]}`);
   }
