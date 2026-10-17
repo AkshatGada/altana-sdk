@@ -21,6 +21,7 @@ import type { IntentOutcome, SessionLegDeps } from "./internal/sessionLegs.js";
 import type { CacheSyncReport, Session } from "./internal/sessions.js";
 import { createPrivateKeySigner, type Signer } from "./internal/signer.js";
 import { runGrantSession } from "./grantSession.js";
+import { awaitPendingIntents, isPendingIntentHeld } from "./internal/pendingIntents.js";
 import { runRevokeSession, type RevokeSessionResult } from "./revokeSession.js";
 
 const WALLET = { address: "0x1111111111111111111111111111111111111111" as Address };
@@ -134,9 +135,17 @@ function revoke(
   return runRevokeSession(WALLET, createPrivateKeySigner(), key, { networks, ...extra }, deps);
 }
 
-function grant(networks: NetworkConfig[], deps: SessionLegDeps, extra: Record<string, unknown> = {}) {
+function grant(
+  networks: NetworkConfig[],
+  deps: SessionLegDeps,
+  extra: Record<string, unknown> = {},
+  // The pending-intent holds are module state keyed by wallet and chain, so a
+  // test that asserts about them uses a wallet of its own rather than relying
+  // on every other test in this file having released WALLET's.
+  wallet: { address: Address } = WALLET,
+) {
   return runGrantSession(
-    WALLET,
+    wallet,
     createPrivateKeySigner(),
     { permissions: {}, expiry: 1_800_000_000, sessionSigner: createPrivateKeySigner(), ...extra },
     { networks },
@@ -719,6 +728,77 @@ describe("grantSession authorizes a cached network first", () => {
       "registry:CONFIRMED",
     ]);
     expect((result as unknown as { registration?: unknown }).registration).toBeUndefined();
+  });
+});
+
+/**
+ * While a background registration is running, the wallet's L2 has an intent of
+ * this SDK's in flight on it -- the source-side intent that pays for the L1
+ * write. The relay reserves no nonce for an unmined intent, so a caller's
+ * `execute` has to wait for that window to close rather than be prepared
+ * against the same nonce.
+ */
+describe("grantSession holds the caller off the L2 during the registration", () => {
+  /** Whether a promise is still unresolved right now. */
+  const PENDING = Symbol("pending");
+  const stillWaiting = async (p: Promise<unknown>) =>
+    (await Promise.race([p, Promise.resolve(PENDING)])) === PENDING;
+  const own = (n: number) => ({ address: `0x${n.toString(16).padStart(40, "0")}` as Address });
+
+  test("the L2 is held while the write runs and released when it lands", async () => {
+    const w = own(0xa1);
+    const { deps, release } = fakeChains({ holdRegistry: [11155111] });
+    const result = await grant([CELO_SEPOLIA], deps, {}, w);
+
+    // The grant has returned and the write is still going: an execute on Celo
+    // for this wallet must wait.
+    expect(isPendingIntentHeld(11142220, w.address)).toBe(true);
+    expect(await stillWaiting(awaitPendingIntents(11142220, w.address))).toBe(true);
+    // The registry chain itself is not held: the write is not paid from there.
+    expect(isPendingIntentHeld(11155111, w.address)).toBe(false);
+
+    release();
+    await result.registration;
+    await awaitPendingIntents(11142220, w.address);
+    expect(isPendingIntentHeld(11142220, w.address)).toBe(false);
+  });
+
+  test("a registration that fails releases the hold, it does not wedge the wallet", async () => {
+    const w = own(0xa2);
+    const { deps } = fakeChains({ failRegistry: [11155111] });
+    const result = await grant([CELO_SEPOLIA], deps, {}, w);
+
+    const legs = await result.registration;
+    expect(legs.find((l) => l.chainId === 11155111)!.status).toBe("FAILED");
+    await awaitPendingIntents(11142220, w.address);
+    expect(isPendingIntentHeld(11142220, w.address)).toBe(false);
+  });
+
+  test("nothing is held when no write was deferred", async () => {
+    // Already registered: no background work, so no reason to hold anything.
+    const w = own(0xa3);
+    const { deps } = fakeChains({ registryValid: [11155111] });
+    await grant([CELO_SEPOLIA], deps, {}, w);
+
+    expect(isPendingIntentHeld(11142220, w.address)).toBe(false);
+    expect(await stillWaiting(awaitPendingIntents(11142220, w.address))).toBe(false);
+  });
+
+  test("every L2 behind the registry is held, since the relay picks which one pays", async () => {
+    const w = own(0xa4);
+    const { deps, release } = fakeChains({ holdRegistry: [11155111] });
+    const result = await grant([CELO_SEPOLIA, BASE_SEPOLIA], deps, {}, w);
+
+    expect(isPendingIntentHeld(11142220, w.address)).toBe(true);
+    expect(isPendingIntentHeld(84532, w.address)).toBe(true);
+
+    release();
+    await result.registration;
+    await Promise.all([
+      awaitPendingIntents(11142220, w.address),
+      awaitPendingIntents(84532, w.address),
+    ]);
+    expect(isPendingIntentHeld(84532, w.address)).toBe(false);
   });
 });
 

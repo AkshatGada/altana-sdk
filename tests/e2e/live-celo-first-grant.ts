@@ -243,7 +243,20 @@ async function main() {
   // ── 2. The session acts, while the registration is in flight. ──
   console.log("\n[2] execute with the SESSION key, registration still in flight");
   const session = grant as unknown as Session;
+  // The SDK holds the caller off this L2 while the registration has an intent
+  // of its own in flight there, so this call is expected to BLOCK and then go.
+  // How long it blocks is the cost of that hold, and it is the number to watch.
+  const calledAt = Date.now();
+  console.log(`    ${at()} calling execute`);
   const exec = await executeProbe(client, session, funder.address, grant.keyHash);
+  const waited = (Date.now() - calledAt) / 1000;
+  console.log(`    execute returned after ${waited.toFixed(1)}s`);
+  record.executeCalledAt = `t+${((calledAt - t0) / 1000).toFixed(1)}s`;
+  record.executeBlockedSeconds = Number(waited.toFixed(1));
+  const nonceErrors = exec.attempts.filter((a) => /InvalidNonce|invalid nonce|nonce/i.test(a));
+  record.nonceErrors = nonceErrors;
+  assert(nonceErrors.length === 0, `no attempt hit a nonce error (${nonceErrors.length} did)`);
+  assert(exec.attempts.length === 1, `it took one attempt, not a retry loop (${exec.attempts.length})`);
   record.sessionExecuteAttempts = exec.attempts;
   assert(exec.status === "CONFIRMED", `the session's transaction confirmed (${exec.status})`);
   const executed = await blockTime(pub, exec.hash);

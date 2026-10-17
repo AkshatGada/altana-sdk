@@ -13,6 +13,7 @@ import {
 } from "./internal/relay.js";
 import type { ExecuteResult, Wallet } from "./internal/types.js";
 import type { Session } from "./internal/sessions.js";
+import { awaitPendingIntents } from "./internal/pendingIntents.js";
 
 export type ExecuteOptions = {
   /** Which chain to run on. Resolved by the client from a chainId. */
@@ -119,6 +120,14 @@ export async function executeWithReceipts(
         publicKey: signer.publicKey,
         role: "admin",
       };
+
+  // If this SDK has an intent of its own in flight for this wallet on this
+  // chain -- a grant's background KeyStore registration pays for the L1 write
+  // with an intent from the wallet's account on the L2 -- wait for it. The
+  // relay hands out the account's on-chain nonce verbatim, so preparing now
+  // would read the same nonce and this intent would fail `InvalidNonce`.
+  // Resolves at once when nothing is in flight, which is the ordinary case.
+  await awaitPendingIntents(network.chainId, walletAddress);
 
   const { callsId, feeToken } = await submitCallsDetailed(
     relayClient,
