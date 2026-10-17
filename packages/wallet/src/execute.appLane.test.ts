@@ -13,7 +13,8 @@ import { numberToHex, type Address, type Hex } from "viem";
 import { CELO_SEPOLIA } from "./config.js";
 import { createPrivateKeySigner } from "./internal/signer.js";
 import { execute } from "./execute.js";
-import { APP_LANE_SEQ_KEY, appLaneNonce } from "./internal/appNonceLane.js";
+import { APP_LANE_PREFIX, laneForKeyHash, laneNonce } from "./internal/appNonceLane.js";
+import { keyHashForSigner } from "./internal/erc1271.js";
 import capabilities from "./internal/fixtures/celo-sepolia-capabilities.json" with { type: "json" };
 import prepared from "./internal/fixtures/celo-sepolia-prepare-calls.json" with { type: "json" };
 
@@ -33,6 +34,7 @@ afterEach(() => {
  */
 function mockWire(laneCounter: bigint | "undelegated") {
   const nonces: (string | undefined)[] = [];
+  const lanesAsked: bigint[] = [];
   let getNonceCalls = 0;
   globalThis.fetch = (async (_url: any, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body));
@@ -43,10 +45,14 @@ function mockWire(laneCounter: bigint | "undelegated") {
         const data = String(req.params?.[0]?.data ?? "");
         if (data.startsWith(GET_NONCE_SELECTOR)) {
           getNonceCalls += 1;
+          // The lane is the call's only argument, so the mock can report which
+          // lane the SDK asked about as well as answer it.
+          const lane = BigInt(`0x${data.slice(10)}`);
+          lanesAsked.push(lane);
           if (laneCounter === "undelegated") {
             return { jsonrpc: "2.0", id: req.id, error: { code: 3, message: "execution reverted" } };
           }
-          return ok(numberToHex(appLaneNonce(laneCounter), { size: 32 }));
+          return ok(numberToHex(laneNonce(lane, laneCounter), { size: 32 }));
         }
         return ok("0x");
       }
@@ -70,38 +76,62 @@ function mockWire(laneCounter: bigint | "undelegated") {
     });
     return new Response(JSON.stringify(Array.isArray(body) ? answers : answers[0]), { status: 200 });
   }) as typeof fetch;
-  return { nonces, getNonceCalls: () => getNonceCalls };
+  return { nonces, lanesAsked, getNonceCalls: () => getNonceCalls };
 }
 
 const wallet = (n: number) => ({ address: `0x${n.toString(16).padStart(40, "0")}` as Address });
-const run = (w: { address: Address }) =>
-  execute(w, createPrivateKeySigner(), CALLS, { network: CELO_SEPOLIA, noWait: true });
+const run = (w: { address: Address }, signer = createPrivateKeySigner()) =>
+  execute(w, signer, CALLS, { network: CELO_SEPOLIA, noWait: true });
 
 describe("execute puts an app transaction on the SDK's lane", () => {
-  test("the prepare carries a nonce on the app lane, not lane 0", async () => {
+  test("the prepare carries a nonce on the SIGNING KEY's lane, not lane 0", async () => {
     const wire = mockWire(3n);
-    const result = await run(wallet(0xc1));
+    const signer = createPrivateKeySigner();
+    const result = await run(wallet(0xc1), signer);
 
     expect(result.callsId).toBe("0xabc");
     expect(wire.nonces).toHaveLength(1);
     const sent = BigInt(wire.nonces[0]!);
-    expect(sent >> 64n).toBe(APP_LANE_SEQ_KEY);
+    // The lane is the one derived from the key that signed, not a fixed one.
+    expect(sent >> 64n).toBe(laneForKeyHash(keyHashForSigner(signer)));
+    expect(sent >> 240n).toBe(APP_LANE_PREFIX);
     expect(sent & ((1n << 64n) - 1n)).toBe(3n);
     // The thing this is all for: not the lane the relay allocates from.
     expect(sent >> 64n).not.toBe(0n);
+    // And it asked the account about that lane.
+    expect(wire.lanesAsked).toEqual([laneForKeyHash(keyHashForSigner(signer))]);
   });
 
-  test("two back-to-back transactions carry consecutive counters", async () => {
+  test("two different signers on one wallet use two different lanes", async () => {
+    const wire = mockWire(0n);
+    const w = wallet(0xc4);
+    const a = createPrivateKeySigner();
+    const b = createPrivateKeySigner();
+    await run(w, a);
+    await run(w, b);
+
+    const [first, second] = wire.nonces.map((n) => BigInt(n!));
+    expect(first! >> 64n).toBe(laneForKeyHash(keyHashForSigner(a)));
+    expect(second! >> 64n).toBe(laneForKeyHash(keyHashForSigner(b)));
+    expect(first! >> 64n).not.toBe(second! >> 64n);
+    // Each starts from its own lane's counter rather than continuing the other's.
+    expect(first! & ((1n << 64n) - 1n)).toBe(0n);
+    expect(second! & ((1n << 64n) - 1n)).toBe(0n);
+  });
+
+  test("one key's back-to-back transactions carry consecutive counters", async () => {
     // The account's answer never changes, which is exactly the read-after-write
     // case that hands out one nonce twice on lane 0.
     const wire = mockWire(0n);
     const w = wallet(0xc2);
-    await run(w);
-    await run(w);
-    await run(w);
+    const signer = createPrivateKeySigner();
+    await run(w, signer);
+    await run(w, signer);
+    await run(w, signer);
 
     expect(wire.nonces.map((n) => BigInt(n!) & ((1n << 64n) - 1n))).toEqual([0n, 1n, 2n]);
-    expect(wire.nonces.every((n) => BigInt(n!) >> 64n === APP_LANE_SEQ_KEY)).toBe(true);
+    const lane = laneForKeyHash(keyHashForSigner(signer));
+    expect(wire.nonces.every((n) => BigInt(n!) >> 64n === lane)).toBe(true);
   });
 
   test("an undelegated wallet sends no nonce, leaving the relay to choose", async () => {
